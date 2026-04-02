@@ -40,4 +40,4 @@ Minimum recommendation for CPU mining: `32GB RAM`.
 - Scorer model checkpoint: expect tens of GB of disk headroom
 - Stable outbound HTTPS access to the PS is required
 - Scorer endpoints must be reachable by the aggregator
-
+- Miner and scorer both write local epoch reports to `~/.alice/reports/`

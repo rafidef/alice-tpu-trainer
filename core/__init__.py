@@ -1,1 +1,1 @@
-"""Core components for the Alice AI Training Network MVP."""
+"""Local client utilities for the Alice miner and scorer release repo."""

@@ -47,6 +47,7 @@ import shutil
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any
 
+import requests
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -54,6 +55,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+from core.reporting import append_jsonl, ensure_report_dir, utc_now_iso, write_markdown
 
 # --- aiohttp import (lightweight HTTP server) ---
 try:
@@ -82,6 +84,108 @@ SCORE_TIMEOUT = 120  # max seconds per scoring operation
 SAFE_MAX_SEQ_LEN = int(os.environ.get("ALICE_SAFE_MAX_SEQ_LEN", "2048"))
 VALIDATION_SEQ_LEN = int(os.environ.get("ALICE_VALIDATION_SEQ_LEN", "128"))
 VALIDATION_BATCHES_PER_SHARD = int(os.environ.get("ALICE_VALIDATION_BATCHES_PER_SHARD", "1"))
+DEFAULT_REPORT_DIR = Path.home() / ".alice" / "reports"
+
+
+def _read_cpu_model() -> str:
+    try:
+        system = platform.system()
+        if system == "Darwin":
+            import subprocess
+            return subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                text=True,
+            ).strip()
+        if system == "Linux":
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    if "model name" in line:
+                        return line.split(":", 1)[1].strip()
+        if system == "Windows":
+            return platform.processor().strip()
+    except Exception:
+        pass
+    return platform.processor().strip() or "Unknown"
+
+
+def detect_device_info(device_override: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        psutil = None
+
+    selected = str(device_override or detect_device()).strip().lower()
+    ram_gb = 0.0
+    if psutil is not None:
+        try:
+            ram_gb = round(psutil.virtual_memory().total / 1e9, 1)
+        except Exception:
+            ram_gb = 0.0
+
+    info: Dict[str, Any] = {
+        "os": platform.system(),
+        "platform": platform.system().lower(),
+        "arch": platform.machine(),
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "ram_gb": ram_gb,
+        "system_memory_gb": ram_gb,
+        "cpu_model": _read_cpu_model(),
+        "cpu_count": os.cpu_count() or 0,
+        "device_type": "cpu",
+        "device": "cpu",
+        "device_name": "CPU",
+        "gpu_model": "CPU-only",
+        "gpu_vram_gb": 0.0,
+        "vram_gb": 0.0,
+        "unified_memory_gb": 0.0,
+        "gpu_count": 0,
+        "vendor": "cpu",
+        "memory_gb": ram_gb,
+    }
+
+    if selected == "cuda" and torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        vram_gb = round(props.total_memory / 1e9, 1)
+        gpu_model = torch.cuda.get_device_name(0)
+        info.update({
+            "device_type": "cuda",
+            "device": "cuda",
+            "device_name": gpu_model,
+            "gpu_model": gpu_model,
+            "gpu_vram_gb": vram_gb,
+            "vram_gb": vram_gb,
+            "gpu_count": torch.cuda.device_count(),
+            "vendor": "nvidia",
+            "memory_gb": vram_gb,
+        })
+        return info
+
+    mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    if selected == "mps" and mps_available:
+        gpu_model = info["cpu_model"] or f"Apple Silicon ({platform.machine()})"
+        info.update({
+            "device_type": "mps",
+            "device": "mps",
+            "device_name": gpu_model,
+            "gpu_model": gpu_model,
+            "gpu_vram_gb": ram_gb,
+            "unified_memory_gb": ram_gb,
+            "vendor": "apple",
+            "memory_gb": ram_gb,
+        })
+        return info
+
+    return info
+
+
+def format_device_log_line(info: Dict[str, Any]) -> str:
+    device_type = str(info.get("device_type") or "cpu").lower()
+    if device_type == "cuda":
+        return f"[Device] {info.get('gpu_model', 'Unknown CUDA GPU')}, {float(info.get('gpu_vram_gb', 0.0)):.1f}GB VRAM, CUDA"
+    if device_type == "mps":
+        return f"[Device] {info.get('gpu_model', 'Apple Silicon')}, {float(info.get('ram_gb', 0.0)):.1f}GB unified memory, MPS"
+    return f"[Device] {info.get('cpu_model', 'Unknown CPU')}, {float(info.get('ram_gb', 0.0)):.1f}GB RAM, CPU-only"
 
 
 # =============================================================================
@@ -89,7 +193,7 @@ VALIDATION_BATCHES_PER_SHARD = int(os.environ.get("ALICE_VALIDATION_BATCHES_PER_
 # =============================================================================
 
 def resolve_model_dtype(dtype_name: str, device: str) -> tuple[torch.dtype, str]:
-    normalized = (dtype_name or "float16").strip().lower()
+    normalized = (dtype_name or "auto").strip().lower()
     if normalized == "auto":
         normalized = "float16" if platform.machine() in ("arm64", "aarch64") else "float32"
 
@@ -513,7 +617,9 @@ def _compute_validation_loss(
 
 class ScoringServer:
     def __init__(self, model, validation_shards, device, model_version=0,
-                 ps_url="", model_path="", model_dtype="float16"):
+                 ps_url="", model_path="", model_dtype="float16",
+                 report_dir: Optional[str] = None,
+                 scorer_address: str = ""):
         self.model = model
         self.validation_shards = validation_shards
         self.validation_shard_map = {
@@ -526,6 +632,7 @@ class ScoringServer:
         self.model_version = model_version
         self.ps_url = ps_url.rstrip("/") if ps_url else ""
         self.model_path = model_path  # Path to current model file on disk
+        self.device_info = detect_device_info(device)
         self._baseline_dir = Path(model_path).resolve().parent
         self._current_model_path = self._baseline_dir / "current_full.pt"
         self._current_version_path = self._baseline_dir / "current_version.txt"
@@ -535,12 +642,211 @@ class ScoringServer:
         self._scored_ids = set()  # Idempotency tracking
         self._scored_results = {}  # Cache for idempotent responses
         self._model_lock = threading.Lock()
+        self.report_dir = ensure_report_dir(Path(report_dir or DEFAULT_REPORT_DIR))
+        self.scorer_address = str(scorer_address or "").strip()
+        self._report_lock = threading.Lock()
+        self._current_epoch_stats: Optional[Dict[str, Any]] = None
+        self._last_balance_total: Optional[float] = None
+        self._report_state_path = self.report_dir / "scorer_runtime_state.json"
+
+        if self.scorer_address and self.ps_url:
+            state = self._load_report_state()
+            stored_balance = state.get("last_balance_total")
+            if isinstance(stored_balance, (int, float)):
+                self._last_balance_total = float(stored_balance)
+            else:
+                self._last_balance_total = self._fetch_balance_total()
 
         # Start background model update loop (checks PS every 5 min)
         if self.ps_url:
             threading.Thread(target=self._model_update_loop, daemon=True,
                              name="model_update").start()
             log.info(f"[AUTO-UPDATE] Enabled, checking {self.ps_url} every 300s")
+            threading.Thread(target=self._epoch_report_loop, daemon=True, name="epoch_report").start()
+
+    def _load_report_state(self) -> Dict[str, Any]:
+        try:
+            if not self._report_state_path.exists():
+                return {}
+            raw = json.loads(self._report_state_path.read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_report_state(self) -> None:
+        payload = {
+            "last_balance_total": self._last_balance_total,
+            "scorer_address": self.scorer_address,
+            "updated_at": utc_now_iso(),
+        }
+        tmp = Path(f"{self._report_state_path}.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        os.replace(tmp, self._report_state_path)
+
+    def _safe_get_json(self, url: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _fetch_balance_total(self) -> Optional[float]:
+        if not self.ps_url or not self.scorer_address:
+            return None
+        data = self._safe_get_json(f"{self.ps_url}/balance/{self.scorer_address}", timeout=10)
+        if not data:
+            return None
+        try:
+            return float(data.get("total", 0.0))
+        except Exception:
+            return None
+
+    def _new_epoch_stats(self, epoch_id: int) -> Dict[str, Any]:
+        return {
+            "role": "scorer",
+            "epoch": int(epoch_id),
+            "started_at": time.time(),
+            "started_at_iso": utc_now_iso(),
+            "model_version": int(self.model_version),
+            "model_dtype": self.model_dtype,
+            "validation_shards": len(self.validation_shards),
+            "scored_submissions": 0,
+            "score_errors": 0,
+            "fetch_errors": 0,
+            "score_time_ms_total": 0,
+        }
+
+    def _mark_score_success(self, elapsed_ms: int) -> None:
+        with self._report_lock:
+            if self._current_epoch_stats is None:
+                return
+            self._current_epoch_stats["scored_submissions"] += 1
+            self._current_epoch_stats["score_time_ms_total"] += int(elapsed_ms)
+
+    def _mark_score_error(self, kind: str) -> None:
+        with self._report_lock:
+            if self._current_epoch_stats is None:
+                return
+            if kind == "fetch":
+                self._current_epoch_stats["fetch_errors"] += 1
+            else:
+                self._current_epoch_stats["score_errors"] += 1
+
+    def _emit_epoch_report(self, stats: Optional[Dict[str, Any]]) -> None:
+        if not stats:
+            return
+        with self._report_lock:
+            ended_at = time.time()
+            current_total = self._fetch_balance_total()
+            reward_status = "pending"
+            reward_amount = None
+            reward_source = "balance_delta"
+            if current_total is not None and self._last_balance_total is not None:
+                delta = round(current_total - self._last_balance_total, 4)
+                if delta > 0:
+                    reward_status = "confirmed"
+                    reward_amount = delta
+                    self._last_balance_total = current_total
+                    self._save_report_state()
+            elif current_total is not None and self._last_balance_total is None:
+                self._last_balance_total = current_total
+                self._save_report_state()
+
+            avg_ms = (
+                float(stats["score_time_ms_total"]) / float(stats["scored_submissions"])
+                if int(stats.get("scored_submissions", 0) or 0) > 0
+                else None
+            )
+            summary = {
+                "role": "scorer",
+                "epoch": int(stats["epoch"]),
+                "started_at": stats["started_at_iso"],
+                "ended_at": utc_now_iso(),
+                "duration_seconds": round(max(0.0, ended_at - float(stats["started_at"])), 2),
+                "scorer_address": self.scorer_address or None,
+                "model_version": int(stats["model_version"]),
+                "model_dtype": stats["model_dtype"],
+                "validation_shards": int(stats["validation_shards"]),
+                "scored_submissions": int(stats["scored_submissions"]),
+                "score_errors": int(stats["score_errors"]),
+                "fetch_errors": int(stats["fetch_errors"]),
+                "avg_score_ms": round(avg_ms, 2) if avg_ms is not None else None,
+                "reward_status": reward_status,
+                "reward_amount": reward_amount,
+                "reward_source": reward_source,
+            }
+            append_jsonl(self.report_dir / "scorer_epoch_reports.jsonl", summary)
+            write_markdown(
+                self.report_dir / "epochs" / f"scorer_epoch_{summary['epoch']}.md",
+                [
+                    f"# Scorer Epoch {summary['epoch']}",
+                    "",
+                    f"- Started: {summary['started_at']}",
+                    f"- Ended: {summary['ended_at']}",
+                    f"- Duration: {summary['duration_seconds']}s",
+                    f"- Model version: {summary['model_version']}",
+                    f"- Dtype: {summary['model_dtype']}",
+                    f"- Validation shards: {summary['validation_shards']}",
+                    f"- Scored submissions: {summary['scored_submissions']}",
+                    f"- Score errors: {summary['score_errors']}",
+                    f"- Fetch errors: {summary['fetch_errors']}",
+                    f"- Average score ms: {summary['avg_score_ms']}",
+                    f"- Reward status: {summary['reward_status']}",
+                    f"- Reward amount: {summary['reward_amount']}",
+                ],
+            )
+            log.info(
+                "[EpochReport][scorer] epoch=%s scored=%s avg_ms=%s reward_status=%s reward=%s",
+                summary["epoch"],
+                summary["scored_submissions"],
+                summary["avg_score_ms"],
+                summary["reward_status"],
+                summary["reward_amount"],
+            )
+            print(
+                f"[EpochReport][scorer] epoch={summary['epoch']} scored={summary['scored_submissions']} "
+                f"avg_ms={summary['avg_score_ms']} reward_status={summary['reward_status']} "
+                f"reward={summary['reward_amount']}"
+            )
+
+    def _transition_epoch(self, epoch_id: Optional[int]) -> None:
+        if epoch_id is None or int(epoch_id) < 0:
+            return
+        with self._report_lock:
+            if self._current_epoch_stats is None:
+                self._current_epoch_stats = self._new_epoch_stats(int(epoch_id))
+                return
+            current_epoch = int(self._current_epoch_stats["epoch"])
+            if int(epoch_id) == current_epoch:
+                return
+            old_stats = self._current_epoch_stats
+            self._current_epoch_stats = self._new_epoch_stats(int(epoch_id))
+        self._emit_epoch_report(old_stats)
+
+    def _epoch_report_loop(self) -> None:
+        while True:
+            try:
+                if self.ps_url:
+                    data = self._safe_get_json(f"{self.ps_url}/epoch/current", timeout=10)
+                    live_epoch = data.get("epoch") if isinstance(data, dict) else None
+                    if isinstance(live_epoch, int):
+                        with self._report_lock:
+                            if self._current_epoch_stats is None:
+                                self._current_epoch_stats = self._new_epoch_stats(int(live_epoch))
+                                old_stats = None
+                            elif int(live_epoch) > int(self._current_epoch_stats["epoch"]):
+                                old_stats = self._current_epoch_stats
+                                self._current_epoch_stats = self._new_epoch_stats(int(live_epoch))
+                            else:
+                                old_stats = None
+                        if old_stats is not None:
+                            self._emit_epoch_report(old_stats)
+                time.sleep(60)
+            except Exception:
+                time.sleep(60)
 
     def _persist_version_marker(self, version: int) -> None:
         tmp_version = Path(f"{self._current_version_path}.tmp")
@@ -651,6 +957,7 @@ class ScoringServer:
             return web.json_response({"error": f"missing fields: {missing}"}, status=400)
 
         sid = body["submission_id"]
+        self._transition_epoch(body.get("epoch_id"))
 
         # --- Idempotency check ---
         if sid in self._scored_results:
@@ -684,6 +991,7 @@ class ScoringServer:
             async with aiohttp.ClientSession() as session:
                 async with session.get(gradient_url, timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT)) as resp:
                     if resp.status != 200:
+                        self._mark_score_error("fetch")
                         return web.json_response(
                             {"error": f"gradient_fetch_failed: HTTP {resp.status}", "submission_id": sid},
                             status=502,
@@ -716,6 +1024,7 @@ class ScoringServer:
 
             self.scored_count += 1
             self.total_time += elapsed_ms / 1000
+            self._mark_score_success(elapsed_ms)
 
             log.info(
                 f"[SCORE] {sid[:12]}... done: score={score:.6f}, "
@@ -726,11 +1035,13 @@ class ScoringServer:
 
         except asyncio.TimeoutError:
             log.error(f"[SCORE] {sid[:12]}... timeout fetching gradient")
+            self._mark_score_error("fetch")
             return web.json_response(
                 {"error": "gradient_fetch_timeout", "submission_id": sid}, status=504
             )
         except Exception as e:
             log.error(f"[SCORE] {sid[:12]}... error: {e}", exc_info=True)
+            self._mark_score_error("score")
             return web.json_response(
                 {"error": str(e), "submission_id": sid}, status=500
             )
@@ -972,6 +1283,7 @@ class ScoringServer:
     async def handle_health(self, request: web.Request) -> web.Response:
         """GET /health — liveness + status"""
         avg_ms = (self.total_time / self.scored_count * 1000) if self.scored_count > 0 else 0
+        device_info = dict(self.device_info)
         return web.json_response({
             "status": "ok",
             "device": self.device,
@@ -981,6 +1293,12 @@ class ScoringServer:
             "scored_count": self.scored_count,
             "avg_score_ms": round(avg_ms),
             "validation_shards": len(self.validation_shards),
+            "gpu_model": device_info.get("gpu_model"),
+            "gpu_vram_gb": device_info.get("gpu_vram_gb"),
+            "cpu_model": device_info.get("cpu_model"),
+            "ram_gb": device_info.get("ram_gb"),
+            "os": device_info.get("os"),
+            "arch": device_info.get("arch"),
         })
 
     async def handle_validate(self, request: web.Request) -> web.Response:
@@ -1149,6 +1467,56 @@ def detect_device() -> str:
     return "cpu"
 
 
+def register_scorer_endpoint(ps_url: str, scorer_address: str, public_endpoint: str, model_version: int) -> bool:
+    if not ps_url or not scorer_address or not public_endpoint:
+        return False
+    try:
+        import requests as _requests
+
+        resp = _requests.post(
+            f"{ps_url.rstrip('/')}/scorer/register-endpoint",
+            json={
+                "address": scorer_address,
+                "endpoint": public_endpoint,
+                "model_version": int(model_version or 0),
+            },
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            log.info(f"[SCORER REGISTER] registered endpoint {public_endpoint} for {scorer_address[:12]}")
+            return True
+        log.warning(f"[SCORER REGISTER] failed: HTTP {resp.status_code} body={resp.text[:200]}")
+        return False
+    except Exception as exc:
+        log.warning(f"[SCORER REGISTER] failed: {exc}")
+        return False
+
+
+def start_endpoint_registration_loop(
+    ps_url: str,
+    scorer_address: str,
+    public_endpoint: str,
+    model_version_ref,
+):
+    if not ps_url or not scorer_address or not public_endpoint:
+        return
+
+    def _loop():
+        while True:
+            try:
+                register_scorer_endpoint(
+                    ps_url=ps_url,
+                    scorer_address=scorer_address,
+                    public_endpoint=public_endpoint,
+                    model_version=int(model_version_ref()),
+                )
+            except Exception as exc:
+                log.warning(f"[SCORER REGISTER] loop error: {exc}")
+            time.sleep(60)
+
+    threading.Thread(target=_loop, daemon=True, name="scorer_endpoint_register").start()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Alice Scoring Worker (Phase 1)")
     parser.add_argument("--model-path", required=True, help="Path to model checkpoint (.pt)")
@@ -1156,10 +1524,21 @@ def parse_args():
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"HTTP port (default: {DEFAULT_PORT})")
     parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
     parser.add_argument("--device", default="cpu", help="Device: cpu, auto, cuda, mps")
-    parser.add_argument("--model-dtype", default="float16", help="Model dtype: float16, bfloat16, float32, auto")
+    parser.add_argument("--model-dtype", default="auto", help="Model dtype: float16, bfloat16, float32, auto")
     parser.add_argument("--model-version", type=int, default=0, help="Initial model version")
     parser.add_argument("--num-val-shards", type=int, default=NUM_VALIDATION_SHARDS, help="Number of validation shards to use")
     parser.add_argument("--ps-url", default="", help="Parameter Server URL for auto-update (empty = disabled)")
+    parser.add_argument(
+        "--report-dir",
+        default=str(DEFAULT_REPORT_DIR),
+        help="Directory for local scorer epoch reports (default: ~/.alice/reports)",
+    )
+    parser.add_argument(
+        "--scorer-address",
+        default="",
+        help="On-chain scorer address used for endpoint registration",
+    )
+    parser.add_argument("--public-endpoint", default="", help="Public scorer endpoint URL, e.g. http://my-ip:8090")
     return parser.parse_args()
 
 
@@ -1169,9 +1548,11 @@ def main():
     if args.device != "auto":
         os.environ["DEVICE"] = args.device
     device = detect_device()
+    device_info = detect_device_info(device)
     log.info(f"Using device: {device}")
     _, resolved_dtype_name = resolve_model_dtype(args.model_dtype, device)
     log.info(f"Using model dtype: {resolved_dtype_name} (platform={platform.machine()})")
+    log.info(format_device_log_line(device_info))
 
     resolved_model_path, resolved_model_version = resolve_startup_baseline(
         args.model_path,
@@ -1202,6 +1583,8 @@ def main():
         model_version=resolved_model_version,
         ps_url=args.ps_url,
         model_path=resolved_model_path,
+        report_dir=args.report_dir,
+        scorer_address=args.scorer_address,
     )
 
     app = web.Application()
@@ -1217,6 +1600,22 @@ def main():
     log.info(f"  Model path: {resolved_model_path}")
     log.info(f"  Validation shards: {len(validation_shards)}")
     log.info(f"  Endpoints: POST /score, POST /validate, GET /health, POST /reload")
+
+    if args.ps_url and args.scorer_address and args.public_endpoint:
+        register_scorer_endpoint(
+            ps_url=args.ps_url,
+            scorer_address=args.scorer_address,
+            public_endpoint=args.public_endpoint,
+            model_version=resolved_model_version,
+        )
+        start_endpoint_registration_loop(
+            ps_url=args.ps_url,
+            scorer_address=args.scorer_address,
+            public_endpoint=args.public_endpoint,
+            model_version_ref=lambda: server.model_version,
+        )
+    elif args.scorer_address or args.public_endpoint:
+        log.warning("[SCORER REGISTER] both --scorer-address and --public-endpoint are required for PS endpoint registration")
 
     web.run_app(app, host=args.host, port=args.port, print=None)
 

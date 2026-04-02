@@ -35,8 +35,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from core.model import LlamaNanoModel, LlamaNanoConfig
 from core.compression import TopKCompressor
+from core.reporting import append_jsonl, ensure_report_dir, utc_now_iso, write_markdown
 try:
     from shared.model import AliceConfig, AliceForCausalLM
     ALICE_MODEL_AVAILABLE = True
@@ -50,6 +50,7 @@ DATA_FORMAT = "tensor"
 DEVICE_PROFILE_PATH = Path.home() / ".alice" / "device_profile.json"
 DEVICE_PROFILE_VERSION = 1
 PIDFILE_PATH = Path.home() / ".alice" / "miner.pid"
+DEFAULT_REPORT_DIR = Path.home() / ".alice" / "reports"
 
 MAX_DELTA_HOPS = 10
 KEEP_VERSIONS = 2
@@ -113,6 +114,120 @@ def auto_detect_device() -> Tuple[str, float, str]:
         except Exception:
             memory_gb = 16.0
     return "cpu", memory_gb, (platform.processor() or "Unknown CPU")
+
+
+def _read_cpu_model() -> str:
+    try:
+        system_name = platform.system()
+        if system_name == "Darwin":
+            result = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            value = result.stdout.strip()
+            if value:
+                return value
+        elif system_name == "Linux":
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    if "model name" in line:
+                        _, _, value = line.partition(":")
+                        value = value.strip()
+                        if value:
+                            return value
+        elif system_name == "Windows":
+            value = platform.processor().strip()
+            if value:
+                return value
+    except Exception:
+        pass
+    return platform.processor() or "Unknown"
+
+
+def detect_device_info(device_override: Optional[str] = None) -> Dict[str, Any]:
+    detected_device, detected_memory_gb, detected_name = auto_detect_device()
+    device_type = (device_override or detected_device).lower()
+
+    if device_type not in {"cuda", "mps", "cpu"}:
+        device_type = detected_device
+
+    if device_type == "cuda" and not torch.cuda.is_available():
+        device_type = "cpu"
+    if device_type == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        device_type = "cpu"
+
+    try:
+        import psutil
+        ram_gb = round(psutil.virtual_memory().total / 1e9, 1)
+        cpu_count = int(psutil.cpu_count() or 1)
+    except Exception:
+        ram_gb = round(detected_memory_gb, 1) if device_type == "cpu" else 16.0
+        cpu_count = int(os.cpu_count() or 1)
+
+    cpu_model = _read_cpu_model()
+    gpu_model = "CPU-only"
+    gpu_vram_gb = 0.0
+    gpu_count = 0
+    device_name = cpu_model or detected_name or "Unknown"
+    memory_gb = float(ram_gb if device_type in ("cpu", "mps") else detected_memory_gb)
+
+    if device_type == "cuda" and torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        gpu_model = torch.cuda.get_device_name(0)
+        gpu_vram_gb = round(props.total_memory / 1e9, 1)
+        gpu_count = int(torch.cuda.device_count())
+        device_name = gpu_model
+        memory_gb = gpu_vram_gb
+    elif device_type == "mps":
+        gpu_model = cpu_model or f"Apple Silicon ({platform.machine()})"
+        device_name = gpu_model
+        memory_gb = float(ram_gb)
+
+    memory_cap_env = os.environ.get("ALICE_MEMORY_CAP_GB")
+    if memory_cap_env:
+        try:
+            cap_gb = float(memory_cap_env)
+            if cap_gb > 0:
+                memory_gb = min(memory_gb, cap_gb)
+        except ValueError:
+            pass
+
+    vendor = "nvidia" if device_type == "cuda" else ("apple" if device_type == "mps" else "cpu")
+    platform_name = platform.system()
+    arch = platform.machine().lower()
+
+    return {
+        "device": device_type,
+        "device_type": device_type,
+        "device_name": device_name,
+        "memory_gb": float(memory_gb),
+        "system_memory_gb": float(ram_gb),
+        "cpu_count": cpu_count,
+        "platform": platform_name.lower(),
+        "os": platform_name,
+        "arch": arch,
+        "vendor": vendor,
+        "vram_gb": float(gpu_vram_gb if device_type == "cuda" else 0.0),
+        "unified_memory_gb": float(ram_gb if device_type == "mps" else 0.0),
+        "ram_gb": float(ram_gb),
+        "cpu_model": cpu_model,
+        "gpu_model": gpu_model,
+        "gpu_vram_gb": float(gpu_vram_gb),
+        "gpu_count": gpu_count,
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+    }
+
+
+def format_device_log_line(info: Dict[str, Any]) -> str:
+    device_type = str(info.get("device_type", "cpu")).lower()
+    if device_type == "cuda":
+        return f"[Device] {info.get('gpu_model', 'CUDA GPU')}, {float(info.get('gpu_vram_gb', 0.0)):.1f}GB VRAM, CUDA"
+    if device_type == "mps":
+        return f"[Device] {info.get('gpu_model', 'Apple Silicon')}, {float(info.get('ram_gb', 0.0)):.1f}GB unified memory, MPS"
+    return f"[Device] {info.get('cpu_model', info.get('device_name', 'CPU-only'))}, {float(info.get('ram_gb', 0.0)):.1f}GB RAM, CPU-only"
 
 
 def calculate_layers(memory_gb: float, device_type: str) -> int:
@@ -183,61 +298,16 @@ def with_precision_arg(argv: List[str], precision: str) -> List[str]:
 
 def get_hardware_info(device_override: Optional[str] = None) -> Dict[str, Any]:
     """Detect hardware capabilities with optional device override."""
-    detected_device, detected_memory_gb, detected_name = auto_detect_device()
-    device_type = (device_override or detected_device).lower()
-    device_name = detected_name
-    memory_gb = detected_memory_gb
-
-    if device_type == "cuda":
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(0)
-            memory_gb = props.total_memory / (1024 ** 3)
-            device_name = torch.cuda.get_device_name(0)
-        else:
-            print("⚠️ --device cuda requested but CUDA is unavailable, falling back to CPU")
-            device_type = "cpu"
-    elif device_type == "mps":
-        if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
-            print("⚠️ --device mps requested but MPS is unavailable, falling back to CPU")
-            device_type = "cpu"
-        else:
-            # Keep memory detection from auto-detect path.
-            pass
-    elif device_type == "cpu":
-        pass
-    else:
-        print(f"⚠️ Unknown --device '{device_type}', using auto-detected device '{detected_device}'")
-        device_type = detected_device
-
-    try:
-        import psutil
-        system_memory_gb = psutil.virtual_memory().total / (1024 ** 3)
-        cpu_count = psutil.cpu_count() or 1
-    except Exception:
-        system_memory_gb = detected_memory_gb if device_type == "cpu" else 16.0
-        cpu_count = os.cpu_count() or 1
-
-    if device_type == "cpu":
-        memory_gb = system_memory_gb
-        device_name = platform.processor() or device_name
-
-    memory_cap_env = os.environ.get("ALICE_MEMORY_CAP_GB")
-    if memory_cap_env:
-        try:
-            cap_gb = float(memory_cap_env)
-            if cap_gb > 0:
-                memory_gb = min(memory_gb, cap_gb)
-        except ValueError:
-            pass
-
-    return {
-        "device": device_type,
-        "device_type": device_type,
-        "device_name": device_name,
-        "memory_gb": float(memory_gb),
-        "system_memory_gb": float(system_memory_gb),
-        "cpu_count": int(cpu_count),
-    }
+    detected_device, _, _ = auto_detect_device()
+    selected = (device_override or detected_device).lower()
+    if selected == "cuda" and not torch.cuda.is_available():
+        print("⚠️ --device cuda requested but CUDA is unavailable, falling back to CPU")
+    elif selected == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        print("⚠️ --device mps requested but MPS is unavailable, falling back to CPU")
+    elif selected not in ("cuda", "mps", "cpu"):
+        print(f"⚠️ Unknown --device '{selected}', using auto-detected device '{detected_device}'")
+        selected = detected_device
+    return detect_device_info(selected)
 
 
 def calculate_batch_size(
@@ -385,6 +455,17 @@ def register_miner(
 ) -> Optional[Dict]:
     """Single-step registration (no challenge/signature)."""
     try:
+        device_info = {
+            "device_type": capabilities.get("device_type", "cpu"),
+            "device_name": capabilities.get("device_name", "unknown"),
+            "memory_gb": float(capabilities.get("memory_gb", 0.0)),
+            "system_memory_gb": float(capabilities.get("system_memory_gb", 0.0)),
+            "platform": capabilities.get("platform", platform.system().lower()),
+            "arch": capabilities.get("arch", platform.machine().lower()),
+            "vendor": capabilities.get("vendor", "cpu"),
+            "vram_gb": float(capabilities.get("vram_gb", 0.0)),
+            "unified_memory_gb": float(capabilities.get("unified_memory_gb", 0.0)),
+        }
         payload = {
             "address": wallet_address,
             "wallet": wallet_address,
@@ -397,6 +478,7 @@ def register_miner(
                 "device_name": capabilities.get("device_name", "unknown"),
                 "system_memory_gb": float(capabilities.get("system_memory_gb", 0.0)),
             },
+            "device_info": device_info,
             "reward_address": capabilities.get("reward_address"),
         }
         if instance_id:
@@ -431,7 +513,7 @@ def setup_tiered_training(model: nn.Module, assigned_layers: List[int], n_layers
     Setup tiered training: freeze unassigned layers, enable gradient checkpointing.
     
     Args:
-        model: LlamaNanoModel
+        model: AliceForCausalLM-compatible model
         assigned_layers: List of layer indices to train
         n_layers: Total number of layers in model
     """
@@ -443,13 +525,9 @@ def setup_tiered_training(model: nn.Module, assigned_layers: List[int], n_layers
         param.requires_grad = False
     
     # 2. Unfreeze assigned layers
-    # Detect layer container
-    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
-        layers_container = model.model.layers  # AliceForCausalLM
-    elif hasattr(model, 'layers'):
-        layers_container = model.layers  # LlamaNanoModel
-    else:
-        layers_container = None
+    layers_container = getattr(getattr(model, "model", None), "layers", None)
+    if layers_container is None:
+        raise RuntimeError("Alice model does not expose model.layers")
     
     for i in assigned_layers:
         if layers_container is not None and i < len(layers_container):
@@ -475,9 +553,9 @@ def setup_tiered_training(model: nn.Module, assigned_layers: List[int], n_layers
 
 
 def _assigned_layer_prefixes(model: nn.Module, assigned_layers: List[int]) -> List[str]:
-    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
-        return [f"model.layers.{i}." for i in assigned_layers]  # AliceForCausalLM
-    return [f"layers.{i}." for i in assigned_layers]  # LlamaNanoModel
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise RuntimeError("Alice model does not expose model.layers")
+    return [f"model.layers.{i}." for i in assigned_layers]
 
 
 def _torch_version_at_least(major: int, minor: int) -> bool:
@@ -1489,6 +1567,176 @@ def format_uptime(seconds: float) -> str:
     return f"{hours}h {minutes}m"
 
 
+def _safe_get_json(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 10) -> Optional[Dict[str, Any]]:
+    try:
+        resp = requests.get(url, headers=headers or {}, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _resolve_epoch_id(ps_url: str, task: Optional[Dict[str, Any]], auth_token: Optional[str] = None) -> Optional[int]:
+    if isinstance(task, dict):
+        for key in ("epoch_id", "epoch", "local_epoch"):
+            value = task.get(key)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+    data = _safe_get_json(f"{ps_url}/epoch/current", headers=_auth_headers(auth_token))
+    if not data:
+        return None
+    value = data.get("epoch")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def _lookup_miner_reward(ps_url: str, reward_address: str, epoch: int) -> Dict[str, Any]:
+    details: Dict[str, Any] = {"status": "pending", "amount": None, "source": "none"}
+    if not reward_address:
+        return details
+
+    info = _safe_get_json(f"{ps_url}/miner/{reward_address}", timeout=10)
+    if info:
+        for item in info.get("recent_epochs", []) or []:
+            try:
+                if int(item.get("epoch")) == int(epoch):
+                    details["status"] = "confirmed"
+                    details["amount"] = float(item.get("reward", 0.0))
+                    details["source"] = "miner_endpoint"
+                    return details
+            except Exception:
+                continue
+
+    try:
+        resp = requests.get(f"{ps_url}/epoch/history?limit=20", timeout=10)
+        if resp.status_code == 200:
+            history = resp.json()
+            if isinstance(history, list):
+                for item in history:
+                    if not isinstance(item, dict):
+                        continue
+                    if int(item.get("epoch", -1)) != int(epoch):
+                        continue
+                    rewards = item.get("rewards", {}) or {}
+                    if reward_address in rewards:
+                        details["status"] = "confirmed"
+                        details["amount"] = float(rewards.get(reward_address, 0.0))
+                        details["source"] = "epoch_history"
+                        return details
+    except Exception:
+        pass
+
+    details["source"] = "unavailable"
+    return details
+
+
+def _new_miner_epoch_stats(
+    epoch: int,
+    wallet_address: str,
+    reward_address: str,
+    device: str,
+    precision: str,
+    model_version: int,
+) -> Dict[str, Any]:
+    return {
+        "role": "miner",
+        "epoch": int(epoch),
+        "started_at": time.time(),
+        "started_at_iso": utc_now_iso(),
+        "wallet_address": wallet_address,
+        "reward_address": reward_address,
+        "device": device,
+        "precision": precision,
+        "model_version": int(model_version),
+        "tasks_requested": 0,
+        "tasks_trained": 0,
+        "shards_trained": 0,
+        "batches_trained": 0,
+        "gradients_submitted": 0,
+        "gradients_accepted": 0,
+        "gradients_rejected": 0,
+        "loss_sum": 0.0,
+        "loss_count": 0,
+        "last_task_id": None,
+    }
+
+
+def _emit_miner_epoch_report(report_dir: Path, ps_url: str, stats: Optional[Dict[str, Any]]) -> None:
+    if not stats:
+        return
+
+    report_root = ensure_report_dir(report_dir)
+    epoch = int(stats.get("epoch", -1))
+    reward = _lookup_miner_reward(ps_url, str(stats.get("reward_address", "")), epoch)
+    ended_at = time.time()
+    avg_loss = (
+        float(stats["loss_sum"]) / float(stats["loss_count"])
+        if float(stats.get("loss_count", 0) or 0) > 0
+        else None
+    )
+    summary = {
+        "role": "miner",
+        "epoch": epoch,
+        "started_at": stats.get("started_at_iso"),
+        "ended_at": utc_now_iso(),
+        "duration_seconds": round(max(0.0, ended_at - float(stats.get("started_at", ended_at))), 2),
+        "wallet_address": stats.get("wallet_address"),
+        "reward_address": stats.get("reward_address"),
+        "device": stats.get("device"),
+        "precision": stats.get("precision"),
+        "model_version": stats.get("model_version"),
+        "tasks_requested": int(stats.get("tasks_requested", 0) or 0),
+        "tasks_trained": int(stats.get("tasks_trained", 0) or 0),
+        "shards_trained": int(stats.get("shards_trained", 0) or 0),
+        "batches_trained": int(stats.get("batches_trained", 0) or 0),
+        "gradients_submitted": int(stats.get("gradients_submitted", 0) or 0),
+        "gradients_accepted": int(stats.get("gradients_accepted", 0) or 0),
+        "gradients_rejected": int(stats.get("gradients_rejected", 0) or 0),
+        "avg_loss": round(avg_loss, 6) if avg_loss is not None else None,
+        "reward_status": reward["status"],
+        "reward_amount": reward["amount"],
+        "reward_source": reward["source"],
+        "last_task_id": stats.get("last_task_id"),
+    }
+    append_jsonl(report_root / "miner_epoch_reports.jsonl", summary)
+    write_markdown(
+        report_root / "epochs" / f"miner_epoch_{epoch}.md",
+        [
+            f"# Miner Epoch {epoch}",
+            "",
+            f"- Started: {summary['started_at']}",
+            f"- Ended: {summary['ended_at']}",
+            f"- Duration: {summary['duration_seconds']}s",
+            f"- Device: {summary['device']}",
+            f"- Precision: {summary['precision']}",
+            f"- Model version: {summary['model_version']}",
+            f"- Tasks requested: {summary['tasks_requested']}",
+            f"- Tasks trained: {summary['tasks_trained']}",
+            f"- Shards trained: {summary['shards_trained']}",
+            f"- Batches trained: {summary['batches_trained']}",
+            f"- Gradients submitted: {summary['gradients_submitted']}",
+            f"- Gradients accepted: {summary['gradients_accepted']}",
+            f"- Gradients rejected: {summary['gradients_rejected']}",
+            f"- Average loss: {summary['avg_loss']}",
+            f"- Reward status: {summary['reward_status']}",
+            f"- Reward amount: {summary['reward_amount']}",
+            f"- Reward source: {summary['reward_source']}",
+        ],
+    )
+    print(
+        f"[EpochReport][miner] epoch={epoch} tasks={summary['tasks_trained']} "
+        f"batches={summary['batches_trained']} accepted={summary['gradients_accepted']} "
+        f"reward_status={summary['reward_status']} reward={summary['reward_amount']}"
+    )
+
+
 def download_shard_streaming(ps_url: str, shard_id: int, auth_token: Optional[str] = None) -> Optional[Dict]:
     """Download a single shard using streaming."""
     try:
@@ -1533,11 +1781,11 @@ def train_shard(
     """
     Train model on shard and return gradients from assigned layers.
     
-    Forward pass runs on full model to compute loss.
+    Forward pass runs on the Alice model to compute loss.
     Backward pass only computes gradients for unfrozen (assigned) layers.
-    
+
     Args:
-        model: LlamaNanoModel
+        model: AliceForCausalLM-compatible model
         shard_data: {'tokens': tensor, 'shard_id': int, 'num_tokens': int}
         device: Training device
         assigned_layers: List of layer indices to train
@@ -1850,6 +2098,12 @@ def main():
         choices=["auto", "fp16", "fp32"],
         help="Precision mode selection",
     )
+    parser.add_argument(
+        "--report-dir",
+        type=Path,
+        default=DEFAULT_REPORT_DIR,
+        help="Directory for local miner epoch reports (default: ~/.alice/reports)",
+    )
     args = parser.parse_args()
     args.ps_url = str(args.ps_url).strip().rstrip("/")
 
@@ -1893,6 +2147,7 @@ def main():
     shards_trained = 0
     gradients_accepted = 0
     gradients_rejected = 0
+    current_epoch_stats: Optional[Dict[str, Any]] = None
     profile_path = device_profile_path()
 
     # Never exit on transient errors; only Ctrl+C stops the miner.
@@ -1953,6 +2208,23 @@ def main():
                     pending_task = task
                     break
                 if status == "no_task":
+                    live_epoch = _resolve_epoch_id(args.ps_url, None, auth_token=auth_token)
+                    if current_epoch_stats is None and live_epoch is not None:
+                        current_epoch_stats = _new_miner_epoch_stats(
+                            epoch=live_epoch,
+                            wallet_address=wallet_address,
+                            reward_address=str(args.reward_address or wallet_address),
+                            device=str(capabilities.get("device_type", args.device or "auto")),
+                            precision=str(args.precision or "auto"),
+                            model_version=0,
+                        )
+                    if (
+                        current_epoch_stats is not None
+                        and live_epoch is not None
+                        and int(live_epoch) > int(current_epoch_stats["epoch"])
+                    ):
+                        _emit_miner_epoch_report(Path(args.report_dir), args.ps_url, current_epoch_stats)
+                        current_epoch_stats = None
                     send_heartbeat(args.ps_url, miner_instance_id, capabilities, auth_token=auth_token)
                     time.sleep(10)
                     continue
@@ -2144,6 +2416,7 @@ def main():
                 batch_size_cap = max(1, min(batch_size_cap, profile_batch_cap))
                 dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
                 print(f"📊 Batch size cap restored from profile: {batch_size_cap}")
+            print(format_device_log_line(capabilities))
             expected_layers = calculate_layers(float(capabilities.get("memory_gb", total_memory_gb)), device.type)
             precision = precision_mode.upper()
             device_label = "CPU" if device.type == "cpu" else device.type.upper()
@@ -2245,11 +2518,36 @@ def main():
 
                 task_id = task["task_id"]
                 shard_id = task["shard_id"]
+                task_epoch = _resolve_epoch_id(args.ps_url, task, auth_token=auth_token)
                 task_nonce = task.get("task_nonce")
                 if not isinstance(task_nonce, str) or not task_nonce.strip():
                     print("❌ Task missing task_nonce, requesting next task...")
                     time.sleep(1)
                     continue
+
+                if task_epoch is not None:
+                    if current_epoch_stats is None:
+                        current_epoch_stats = _new_miner_epoch_stats(
+                            epoch=task_epoch,
+                            wallet_address=wallet_address,
+                            reward_address=str(args.reward_address or wallet_address),
+                            device=device.type,
+                            precision=precision_mode,
+                            model_version=int(ps_version),
+                        )
+                    elif int(task_epoch) != int(current_epoch_stats["epoch"]):
+                        _emit_miner_epoch_report(Path(args.report_dir), args.ps_url, current_epoch_stats)
+                        current_epoch_stats = _new_miner_epoch_stats(
+                            epoch=task_epoch,
+                            wallet_address=wallet_address,
+                            reward_address=str(args.reward_address or wallet_address),
+                            device=device.type,
+                            precision=precision_mode,
+                            model_version=int(ps_version),
+                        )
+                    current_epoch_stats["tasks_requested"] += 1
+                    current_epoch_stats["last_task_id"] = task_id
+                    current_epoch_stats["model_version"] = int(ps_version)
 
                 # Download shard
                 print(f"📥 Downloading shard {shard_id}...")
@@ -2347,6 +2645,12 @@ def main():
 
                 shards_trained += 1
                 tasks_processed += 1
+                if current_epoch_stats is not None:
+                    current_epoch_stats["tasks_trained"] += 1
+                    current_epoch_stats["shards_trained"] += 1
+                    current_epoch_stats["batches_trained"] += int(num_batches)
+                    current_epoch_stats["loss_sum"] += float(avg_loss)
+                    current_epoch_stats["loss_count"] += 1
 
                 if bad_param is not None:
                     invalid_streak += 1
@@ -2390,6 +2694,8 @@ def main():
                 }
 
                 print("📤 Submitting gradient...")
+                if current_epoch_stats is not None:
+                    current_epoch_stats["gradients_submitted"] += 1
                 success = submit_gradient(
                     args.ps_url,
                     task_id,
@@ -2400,6 +2706,8 @@ def main():
                 )
                 if success:
                     gradients_accepted += 1
+                    if current_epoch_stats is not None:
+                        current_epoch_stats["gradients_accepted"] += 1
                     save_device_profile(
                         profile_path,
                         profile_key,
@@ -2457,6 +2765,8 @@ def main():
                     print(f"✅ Task {task_id[:8]}... completed in {train_time:.1f}s\n")
                 else:
                     gradients_rejected += 1
+                    if current_epoch_stats is not None:
+                        current_epoch_stats["gradients_rejected"] += 1
                     print(f"❌ Task {task_id[:8]}... failed\n")
 
                 if tasks_processed % 10 == 0:
@@ -2470,9 +2780,13 @@ def main():
                 time.sleep(2)
 
         except KeyboardInterrupt:
+            _emit_miner_epoch_report(Path(args.report_dir), args.ps_url, current_epoch_stats)
+            current_epoch_stats = None
             print("\n🛑 Miner stopped by user")
             return
         except Exception as e:
+            _emit_miner_epoch_report(Path(args.report_dir), args.ps_url, current_epoch_stats)
+            current_epoch_stats = None
             print(f"❌ Unexpected error: {e}. Restarting in 30s...")
             import traceback
             traceback.print_exc()
