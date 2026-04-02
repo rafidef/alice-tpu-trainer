@@ -87,6 +87,107 @@ VALIDATION_BATCHES_PER_SHARD = int(os.environ.get("ALICE_VALIDATION_BATCHES_PER_
 DEFAULT_REPORT_DIR = Path.home() / ".alice" / "reports"
 
 
+def _read_cpu_model() -> str:
+    try:
+        system = platform.system()
+        if system == "Darwin":
+            import subprocess
+            return subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                text=True,
+            ).strip()
+        if system == "Linux":
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    if "model name" in line:
+                        return line.split(":", 1)[1].strip()
+        if system == "Windows":
+            return platform.processor().strip()
+    except Exception:
+        pass
+    return platform.processor().strip() or "Unknown"
+
+
+def detect_device_info(device_override: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        psutil = None
+
+    selected = str(device_override or detect_device()).strip().lower()
+    ram_gb = 0.0
+    if psutil is not None:
+        try:
+            ram_gb = round(psutil.virtual_memory().total / 1e9, 1)
+        except Exception:
+            ram_gb = 0.0
+
+    info: Dict[str, Any] = {
+        "os": platform.system(),
+        "platform": platform.system().lower(),
+        "arch": platform.machine(),
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "ram_gb": ram_gb,
+        "system_memory_gb": ram_gb,
+        "cpu_model": _read_cpu_model(),
+        "cpu_count": os.cpu_count() or 0,
+        "device_type": "cpu",
+        "device": "cpu",
+        "device_name": "CPU",
+        "gpu_model": "CPU-only",
+        "gpu_vram_gb": 0.0,
+        "vram_gb": 0.0,
+        "unified_memory_gb": 0.0,
+        "gpu_count": 0,
+        "vendor": "cpu",
+        "memory_gb": ram_gb,
+    }
+
+    if selected == "cuda" and torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        vram_gb = round(props.total_memory / 1e9, 1)
+        gpu_model = torch.cuda.get_device_name(0)
+        info.update({
+            "device_type": "cuda",
+            "device": "cuda",
+            "device_name": gpu_model,
+            "gpu_model": gpu_model,
+            "gpu_vram_gb": vram_gb,
+            "vram_gb": vram_gb,
+            "gpu_count": torch.cuda.device_count(),
+            "vendor": "nvidia",
+            "memory_gb": vram_gb,
+        })
+        return info
+
+    mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    if selected == "mps" and mps_available:
+        gpu_model = info["cpu_model"] or f"Apple Silicon ({platform.machine()})"
+        info.update({
+            "device_type": "mps",
+            "device": "mps",
+            "device_name": gpu_model,
+            "gpu_model": gpu_model,
+            "gpu_vram_gb": ram_gb,
+            "unified_memory_gb": ram_gb,
+            "vendor": "apple",
+            "memory_gb": ram_gb,
+        })
+        return info
+
+    return info
+
+
+def format_device_log_line(info: Dict[str, Any]) -> str:
+    device_type = str(info.get("device_type") or "cpu").lower()
+    if device_type == "cuda":
+        return f"[Device] {info.get('gpu_model', 'Unknown CUDA GPU')}, {float(info.get('gpu_vram_gb', 0.0)):.1f}GB VRAM, CUDA"
+    if device_type == "mps":
+        return f"[Device] {info.get('gpu_model', 'Apple Silicon')}, {float(info.get('ram_gb', 0.0)):.1f}GB unified memory, MPS"
+    return f"[Device] {info.get('cpu_model', 'Unknown CPU')}, {float(info.get('ram_gb', 0.0)):.1f}GB RAM, CPU-only"
+
+
 # =============================================================================
 # Model loading — import from alice codebase
 # =============================================================================
@@ -531,6 +632,7 @@ class ScoringServer:
         self.model_version = model_version
         self.ps_url = ps_url.rstrip("/") if ps_url else ""
         self.model_path = model_path  # Path to current model file on disk
+        self.device_info = detect_device_info(device)
         self._baseline_dir = Path(model_path).resolve().parent
         self._current_model_path = self._baseline_dir / "current_full.pt"
         self._current_version_path = self._baseline_dir / "current_version.txt"
@@ -1181,6 +1283,7 @@ class ScoringServer:
     async def handle_health(self, request: web.Request) -> web.Response:
         """GET /health — liveness + status"""
         avg_ms = (self.total_time / self.scored_count * 1000) if self.scored_count > 0 else 0
+        device_info = dict(self.device_info)
         return web.json_response({
             "status": "ok",
             "device": self.device,
@@ -1190,6 +1293,12 @@ class ScoringServer:
             "scored_count": self.scored_count,
             "avg_score_ms": round(avg_ms),
             "validation_shards": len(self.validation_shards),
+            "gpu_model": device_info.get("gpu_model"),
+            "gpu_vram_gb": device_info.get("gpu_vram_gb"),
+            "cpu_model": device_info.get("cpu_model"),
+            "ram_gb": device_info.get("ram_gb"),
+            "os": device_info.get("os"),
+            "arch": device_info.get("arch"),
         })
 
     async def handle_validate(self, request: web.Request) -> web.Response:
@@ -1358,6 +1467,56 @@ def detect_device() -> str:
     return "cpu"
 
 
+def register_scorer_endpoint(ps_url: str, scorer_address: str, public_endpoint: str, model_version: int) -> bool:
+    if not ps_url or not scorer_address or not public_endpoint:
+        return False
+    try:
+        import requests as _requests
+
+        resp = _requests.post(
+            f"{ps_url.rstrip('/')}/scorer/register-endpoint",
+            json={
+                "address": scorer_address,
+                "endpoint": public_endpoint,
+                "model_version": int(model_version or 0),
+            },
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            log.info(f"[SCORER REGISTER] registered endpoint {public_endpoint} for {scorer_address[:12]}")
+            return True
+        log.warning(f"[SCORER REGISTER] failed: HTTP {resp.status_code} body={resp.text[:200]}")
+        return False
+    except Exception as exc:
+        log.warning(f"[SCORER REGISTER] failed: {exc}")
+        return False
+
+
+def start_endpoint_registration_loop(
+    ps_url: str,
+    scorer_address: str,
+    public_endpoint: str,
+    model_version_ref,
+):
+    if not ps_url or not scorer_address or not public_endpoint:
+        return
+
+    def _loop():
+        while True:
+            try:
+                register_scorer_endpoint(
+                    ps_url=ps_url,
+                    scorer_address=scorer_address,
+                    public_endpoint=public_endpoint,
+                    model_version=int(model_version_ref()),
+                )
+            except Exception as exc:
+                log.warning(f"[SCORER REGISTER] loop error: {exc}")
+            time.sleep(60)
+
+    threading.Thread(target=_loop, daemon=True, name="scorer_endpoint_register").start()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Alice Scoring Worker (Phase 1)")
     parser.add_argument("--model-path", required=True, help="Path to model checkpoint (.pt)")
@@ -1377,8 +1536,9 @@ def parse_args():
     parser.add_argument(
         "--scorer-address",
         default="",
-        help="Optional scorer reward address for local reward confirmation via /balance/<address>",
+        help="On-chain scorer address used for endpoint registration",
     )
+    parser.add_argument("--public-endpoint", default="", help="Public scorer endpoint URL, e.g. http://my-ip:8090")
     return parser.parse_args()
 
 
@@ -1388,9 +1548,11 @@ def main():
     if args.device != "auto":
         os.environ["DEVICE"] = args.device
     device = detect_device()
+    device_info = detect_device_info(device)
     log.info(f"Using device: {device}")
     _, resolved_dtype_name = resolve_model_dtype(args.model_dtype, device)
     log.info(f"Using model dtype: {resolved_dtype_name} (platform={platform.machine()})")
+    log.info(format_device_log_line(device_info))
 
     resolved_model_path, resolved_model_version = resolve_startup_baseline(
         args.model_path,
@@ -1438,6 +1600,22 @@ def main():
     log.info(f"  Model path: {resolved_model_path}")
     log.info(f"  Validation shards: {len(validation_shards)}")
     log.info(f"  Endpoints: POST /score, POST /validate, GET /health, POST /reload")
+
+    if args.ps_url and args.scorer_address and args.public_endpoint:
+        register_scorer_endpoint(
+            ps_url=args.ps_url,
+            scorer_address=args.scorer_address,
+            public_endpoint=args.public_endpoint,
+            model_version=resolved_model_version,
+        )
+        start_endpoint_registration_loop(
+            ps_url=args.ps_url,
+            scorer_address=args.scorer_address,
+            public_endpoint=args.public_endpoint,
+            model_version_ref=lambda: server.model_version,
+        )
+    elif args.scorer_address or args.public_endpoint:
+        log.warning("[SCORER REGISTER] both --scorer-address and --public-endpoint are required for PS endpoint registration")
 
     web.run_app(app, host=args.host, port=args.port, print=None)
 

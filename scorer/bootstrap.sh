@@ -10,6 +10,7 @@ SHARD_BASE_URL="${ALICE_SHARD_BASE_URL:-https://dl.aliceprotocol.org/shards}"
 MODEL_PATH=""
 VALIDATION_DIR=""
 SCORER_ADDRESS="${ALICE_SCORER_ADDRESS:-}"
+PUBLIC_ENDPOINT="${ALICE_PUBLIC_ENDPOINT:-}"
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -28,6 +29,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --scorer-address)
       SCORER_ADDRESS="${2:-}"
+      shift 2
+      ;;
+    --public-endpoint)
+      PUBLIC_ENDPOINT="${2:-}"
       shift 2
       ;;
     *)
@@ -163,6 +168,10 @@ CMD=(
 
 if [[ -n "$SCORER_ADDRESS" ]]; then
   CMD+=(--scorer-address "$SCORER_ADDRESS")
+fi
+
+if [[ -n "$PUBLIC_ENDPOINT" ]]; then
+  CMD+=(--public-endpoint "$PUBLIC_ENDPOINT")
 fi
 
 CMD+=("${EXTRA_ARGS[@]}")

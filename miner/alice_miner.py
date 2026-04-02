@@ -116,6 +116,120 @@ def auto_detect_device() -> Tuple[str, float, str]:
     return "cpu", memory_gb, (platform.processor() or "Unknown CPU")
 
 
+def _read_cpu_model() -> str:
+    try:
+        system_name = platform.system()
+        if system_name == "Darwin":
+            result = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            value = result.stdout.strip()
+            if value:
+                return value
+        elif system_name == "Linux":
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    if "model name" in line:
+                        _, _, value = line.partition(":")
+                        value = value.strip()
+                        if value:
+                            return value
+        elif system_name == "Windows":
+            value = platform.processor().strip()
+            if value:
+                return value
+    except Exception:
+        pass
+    return platform.processor() or "Unknown"
+
+
+def detect_device_info(device_override: Optional[str] = None) -> Dict[str, Any]:
+    detected_device, detected_memory_gb, detected_name = auto_detect_device()
+    device_type = (device_override or detected_device).lower()
+
+    if device_type not in {"cuda", "mps", "cpu"}:
+        device_type = detected_device
+
+    if device_type == "cuda" and not torch.cuda.is_available():
+        device_type = "cpu"
+    if device_type == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        device_type = "cpu"
+
+    try:
+        import psutil
+        ram_gb = round(psutil.virtual_memory().total / 1e9, 1)
+        cpu_count = int(psutil.cpu_count() or 1)
+    except Exception:
+        ram_gb = round(detected_memory_gb, 1) if device_type == "cpu" else 16.0
+        cpu_count = int(os.cpu_count() or 1)
+
+    cpu_model = _read_cpu_model()
+    gpu_model = "CPU-only"
+    gpu_vram_gb = 0.0
+    gpu_count = 0
+    device_name = cpu_model or detected_name or "Unknown"
+    memory_gb = float(ram_gb if device_type in ("cpu", "mps") else detected_memory_gb)
+
+    if device_type == "cuda" and torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        gpu_model = torch.cuda.get_device_name(0)
+        gpu_vram_gb = round(props.total_memory / 1e9, 1)
+        gpu_count = int(torch.cuda.device_count())
+        device_name = gpu_model
+        memory_gb = gpu_vram_gb
+    elif device_type == "mps":
+        gpu_model = cpu_model or f"Apple Silicon ({platform.machine()})"
+        device_name = gpu_model
+        memory_gb = float(ram_gb)
+
+    memory_cap_env = os.environ.get("ALICE_MEMORY_CAP_GB")
+    if memory_cap_env:
+        try:
+            cap_gb = float(memory_cap_env)
+            if cap_gb > 0:
+                memory_gb = min(memory_gb, cap_gb)
+        except ValueError:
+            pass
+
+    vendor = "nvidia" if device_type == "cuda" else ("apple" if device_type == "mps" else "cpu")
+    platform_name = platform.system()
+    arch = platform.machine().lower()
+
+    return {
+        "device": device_type,
+        "device_type": device_type,
+        "device_name": device_name,
+        "memory_gb": float(memory_gb),
+        "system_memory_gb": float(ram_gb),
+        "cpu_count": cpu_count,
+        "platform": platform_name.lower(),
+        "os": platform_name,
+        "arch": arch,
+        "vendor": vendor,
+        "vram_gb": float(gpu_vram_gb if device_type == "cuda" else 0.0),
+        "unified_memory_gb": float(ram_gb if device_type == "mps" else 0.0),
+        "ram_gb": float(ram_gb),
+        "cpu_model": cpu_model,
+        "gpu_model": gpu_model,
+        "gpu_vram_gb": float(gpu_vram_gb),
+        "gpu_count": gpu_count,
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+    }
+
+
+def format_device_log_line(info: Dict[str, Any]) -> str:
+    device_type = str(info.get("device_type", "cpu")).lower()
+    if device_type == "cuda":
+        return f"[Device] {info.get('gpu_model', 'CUDA GPU')}, {float(info.get('gpu_vram_gb', 0.0)):.1f}GB VRAM, CUDA"
+    if device_type == "mps":
+        return f"[Device] {info.get('gpu_model', 'Apple Silicon')}, {float(info.get('ram_gb', 0.0)):.1f}GB unified memory, MPS"
+    return f"[Device] {info.get('cpu_model', info.get('device_name', 'CPU-only'))}, {float(info.get('ram_gb', 0.0)):.1f}GB RAM, CPU-only"
+
+
 def calculate_layers(memory_gb: float, device_type: str) -> int:
     """Calculate trainable layers based on available memory."""
     if device_type == "cpu":
@@ -184,61 +298,16 @@ def with_precision_arg(argv: List[str], precision: str) -> List[str]:
 
 def get_hardware_info(device_override: Optional[str] = None) -> Dict[str, Any]:
     """Detect hardware capabilities with optional device override."""
-    detected_device, detected_memory_gb, detected_name = auto_detect_device()
-    device_type = (device_override or detected_device).lower()
-    device_name = detected_name
-    memory_gb = detected_memory_gb
-
-    if device_type == "cuda":
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(0)
-            memory_gb = props.total_memory / (1024 ** 3)
-            device_name = torch.cuda.get_device_name(0)
-        else:
-            print("⚠️ --device cuda requested but CUDA is unavailable, falling back to CPU")
-            device_type = "cpu"
-    elif device_type == "mps":
-        if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
-            print("⚠️ --device mps requested but MPS is unavailable, falling back to CPU")
-            device_type = "cpu"
-        else:
-            # Keep memory detection from auto-detect path.
-            pass
-    elif device_type == "cpu":
-        pass
-    else:
-        print(f"⚠️ Unknown --device '{device_type}', using auto-detected device '{detected_device}'")
-        device_type = detected_device
-
-    try:
-        import psutil
-        system_memory_gb = psutil.virtual_memory().total / (1024 ** 3)
-        cpu_count = psutil.cpu_count() or 1
-    except Exception:
-        system_memory_gb = detected_memory_gb if device_type == "cpu" else 16.0
-        cpu_count = os.cpu_count() or 1
-
-    if device_type == "cpu":
-        memory_gb = system_memory_gb
-        device_name = platform.processor() or device_name
-
-    memory_cap_env = os.environ.get("ALICE_MEMORY_CAP_GB")
-    if memory_cap_env:
-        try:
-            cap_gb = float(memory_cap_env)
-            if cap_gb > 0:
-                memory_gb = min(memory_gb, cap_gb)
-        except ValueError:
-            pass
-
-    return {
-        "device": device_type,
-        "device_type": device_type,
-        "device_name": device_name,
-        "memory_gb": float(memory_gb),
-        "system_memory_gb": float(system_memory_gb),
-        "cpu_count": int(cpu_count),
-    }
+    detected_device, _, _ = auto_detect_device()
+    selected = (device_override or detected_device).lower()
+    if selected == "cuda" and not torch.cuda.is_available():
+        print("⚠️ --device cuda requested but CUDA is unavailable, falling back to CPU")
+    elif selected == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        print("⚠️ --device mps requested but MPS is unavailable, falling back to CPU")
+    elif selected not in ("cuda", "mps", "cpu"):
+        print(f"⚠️ Unknown --device '{selected}', using auto-detected device '{detected_device}'")
+        selected = detected_device
+    return detect_device_info(selected)
 
 
 def calculate_batch_size(
@@ -386,6 +455,17 @@ def register_miner(
 ) -> Optional[Dict]:
     """Single-step registration (no challenge/signature)."""
     try:
+        device_info = {
+            "device_type": capabilities.get("device_type", "cpu"),
+            "device_name": capabilities.get("device_name", "unknown"),
+            "memory_gb": float(capabilities.get("memory_gb", 0.0)),
+            "system_memory_gb": float(capabilities.get("system_memory_gb", 0.0)),
+            "platform": capabilities.get("platform", platform.system().lower()),
+            "arch": capabilities.get("arch", platform.machine().lower()),
+            "vendor": capabilities.get("vendor", "cpu"),
+            "vram_gb": float(capabilities.get("vram_gb", 0.0)),
+            "unified_memory_gb": float(capabilities.get("unified_memory_gb", 0.0)),
+        }
         payload = {
             "address": wallet_address,
             "wallet": wallet_address,
@@ -398,6 +478,7 @@ def register_miner(
                 "device_name": capabilities.get("device_name", "unknown"),
                 "system_memory_gb": float(capabilities.get("system_memory_gb", 0.0)),
             },
+            "device_info": device_info,
             "reward_address": capabilities.get("reward_address"),
         }
         if instance_id:
@@ -2335,6 +2416,7 @@ def main():
                 batch_size_cap = max(1, min(batch_size_cap, profile_batch_cap))
                 dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
                 print(f"📊 Batch size cap restored from profile: {batch_size_cap}")
+            print(format_device_log_line(capabilities))
             expected_layers = calculate_layers(float(capabilities.get("memory_gb", total_memory_gb)), device.type)
             precision = precision_mode.upper()
             device_label = "CPU" if device.type == "cpu" else device.type.upper()
