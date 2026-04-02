@@ -11,10 +11,16 @@ if not exist ".venv\Scripts\python.exe" (
 
 set WALLET=%USERPROFILE%\.alice\wallet.json
 set HASADDR=
+set HASREWARD=
+set HASPS=
+set WALLET_ADDR=
+set CMDARGS=%*
 
 :scan
 if "%~1"=="" goto afterscan
 if "%~1"=="--address" set HASADDR=1
+if "%~1"=="--reward-address" set HASREWARD=1
+if "%~1"=="--ps-url" set HASPS=1
 shift
 goto scan
 
@@ -27,12 +33,13 @@ if not exist "%WALLET%" (
 
 for /f "usebackq delims=" %%A in (`.venv\Scripts\python.exe -c "import json, pathlib; print(json.loads((pathlib.Path.home()/'.alice'/'wallet.json').read_text())['address'])"`) do set WALLET_ADDR=%%A
 
-set CMDARGS=--address %WALLET_ADDR% %*
+if not defined HASADDR set CMDARGS=--address %WALLET_ADDR% %CMDARGS%
 
 :run
-if defined HASADDR (
-  .venv\Scripts\python.exe miner\alice_miner.py %*
-) else (
-  .venv\Scripts\python.exe miner\alice_miner.py %CMDARGS%
+if not defined HASREWARD (
+  set CMDARGS=--reward-address %WALLET_ADDR% %CMDARGS%
 )
-
+if not defined HASPS (
+  set CMDARGS=--ps-url https://ps.aliceprotocol.org %CMDARGS%
+)
+.venv\Scripts\python.exe miner\alice_miner.py %CMDARGS%

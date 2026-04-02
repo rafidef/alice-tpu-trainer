@@ -30,29 +30,32 @@ Alice-Protocol/
 
 Entry point: `miner/alice_miner.py`
 
-Quick start:
+Bootstrap:
 
 ```bash
-cd miner
-./install.sh
-./run_miner.sh --ps-url https://ps.aliceprotocol.org
+./miner/bootstrap.sh
+```
+
+Windows:
+
+```powershell
+.\miner\bootstrap.ps1
 ```
 
 ### Scorer
 
 Entry point: `scorer/scoring_server.py`
 
-Quick start:
+Bootstrap:
 
 ```bash
-python3 scorer/scoring_server.py \
-  --model-path /path/to/current_full.pt \
-  --validation-dir /path/to/validation \
-  --host 0.0.0.0 \
-  --port 8090 \
-  --device cpu \
-  --model-dtype auto \
-  --ps-url https://ps.aliceprotocol.org
+./scorer/bootstrap.sh --validation-dir /path/to/validation
+```
+
+Windows:
+
+```powershell
+.\scorer\bootstrap.ps1 --validation-dir C:\path\to\validation
 ```
 
 ## Documentation
@@ -66,5 +69,7 @@ python3 scorer/scoring_server.py \
 
 - This repository is not public yet.
 - Network admission for outside miners remains restricted.
-- Hardware guidance and scripts are included now; full cross-platform validation remains a release gate before public launch.
-
+- Bootstrap is the default user entry point for both miner and scorer.
+- Per-epoch local reports are written to `~/.alice/reports/`.
+- Users who only want scorer files can use sparse checkout after cloning this same repo.
+- Full cross-platform validation remains a release gate before any public launch.

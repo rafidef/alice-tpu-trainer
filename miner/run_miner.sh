@@ -13,10 +13,17 @@ source .venv/bin/activate
 
 WALLET_PATH="${HOME}/.alice/wallet.json"
 HAS_ADDRESS=false
+HAS_REWARD_ADDRESS=false
+HAS_PS_URL=false
 for arg in "$@"; do
   if [[ "$arg" == "--address" ]]; then
     HAS_ADDRESS=true
-    break
+  fi
+  if [[ "$arg" == "--reward-address" ]]; then
+    HAS_REWARD_ADDRESS=true
+  fi
+  if [[ "$arg" == "--ps-url" ]]; then
+    HAS_PS_URL=true
   fi
 done
 
@@ -34,5 +41,21 @@ PY
   set -- --address "$WALLET_ADDRESS" "$@"
 fi
 
-exec python miner/alice_miner.py "$@"
+if [[ "$HAS_REWARD_ADDRESS" == false ]]; then
+  if [[ -z "${WALLET_ADDRESS:-}" ]]; then
+    WALLET_ADDRESS="$(python - <<'PY'
+import json
+from pathlib import Path
+path = Path.home() / ".alice" / "wallet.json"
+print(json.loads(path.read_text())["address"])
+PY
+)"
+  fi
+  set -- --reward-address "$WALLET_ADDRESS" "$@"
+fi
 
+if [[ "$HAS_PS_URL" == false ]]; then
+  set -- --ps-url "https://ps.aliceprotocol.org" "$@"
+fi
+
+exec python miner/alice_miner.py "$@"

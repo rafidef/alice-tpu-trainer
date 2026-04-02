@@ -11,15 +11,13 @@ Current rollout state:
 macOS / Linux:
 
 ```bash
-cd miner
-./install.sh
+./miner/bootstrap.sh
 ```
 
 Windows:
 
 ```powershell
-cd miner
-.\install.ps1
+.\miner\bootstrap.ps1
 ```
 
 ## 2. Create or import an address
@@ -33,6 +31,15 @@ python3 miner/alice_wallet.py create
 If you already have an Alice address, you can pass it directly with `--address`.
 
 ## 3. Start mining
+
+The default bootstrap path will:
+
+- create a repo-local virtual environment
+- install missing dependencies
+- create a local wallet if needed
+- start the miner with `https://ps.aliceprotocol.org` by default
+
+Manual launch is still available:
 
 ```bash
 python3 miner/alice_miner.py \
@@ -80,7 +87,21 @@ Rewards are paid to:
 
 Reward timing depends on successful epoch settlement on chain.
 
-## 7. Current release note
+## 7. Epoch reports
+
+Miner writes local epoch reports to:
+
+- `~/.alice/reports/miner_epoch_reports.jsonl`
+- `~/.alice/reports/epochs/miner_epoch_<epoch>.md`
+
+Each report records:
+
+- tasks requested and trained
+- batches trained
+- gradients submitted, accepted, rejected
+- average loss
+- reward status (`confirmed`, `pending`, `estimate`)
+
+## 8. Current release note
 
 This repository is a private release-prep baseline. Cross-platform validation is still in progress before public access opens.
-

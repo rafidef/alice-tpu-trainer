@@ -35,8 +35,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from core.model import LlamaNanoModel, LlamaNanoConfig
 from core.compression import TopKCompressor
+from core.reporting import append_jsonl, ensure_report_dir, utc_now_iso, write_markdown
 try:
     from shared.model import AliceConfig, AliceForCausalLM
     ALICE_MODEL_AVAILABLE = True
@@ -50,6 +50,7 @@ DATA_FORMAT = "tensor"
 DEVICE_PROFILE_PATH = Path.home() / ".alice" / "device_profile.json"
 DEVICE_PROFILE_VERSION = 1
 PIDFILE_PATH = Path.home() / ".alice" / "miner.pid"
+DEFAULT_REPORT_DIR = Path.home() / ".alice" / "reports"
 
 MAX_DELTA_HOPS = 10
 KEEP_VERSIONS = 2
@@ -431,7 +432,7 @@ def setup_tiered_training(model: nn.Module, assigned_layers: List[int], n_layers
     Setup tiered training: freeze unassigned layers, enable gradient checkpointing.
     
     Args:
-        model: LlamaNanoModel
+        model: AliceForCausalLM-compatible model
         assigned_layers: List of layer indices to train
         n_layers: Total number of layers in model
     """
@@ -443,13 +444,9 @@ def setup_tiered_training(model: nn.Module, assigned_layers: List[int], n_layers
         param.requires_grad = False
     
     # 2. Unfreeze assigned layers
-    # Detect layer container
-    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
-        layers_container = model.model.layers  # AliceForCausalLM
-    elif hasattr(model, 'layers'):
-        layers_container = model.layers  # LlamaNanoModel
-    else:
-        layers_container = None
+    layers_container = getattr(getattr(model, "model", None), "layers", None)
+    if layers_container is None:
+        raise RuntimeError("Alice model does not expose model.layers")
     
     for i in assigned_layers:
         if layers_container is not None and i < len(layers_container):
@@ -475,9 +472,9 @@ def setup_tiered_training(model: nn.Module, assigned_layers: List[int], n_layers
 
 
 def _assigned_layer_prefixes(model: nn.Module, assigned_layers: List[int]) -> List[str]:
-    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
-        return [f"model.layers.{i}." for i in assigned_layers]  # AliceForCausalLM
-    return [f"layers.{i}." for i in assigned_layers]  # LlamaNanoModel
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise RuntimeError("Alice model does not expose model.layers")
+    return [f"model.layers.{i}." for i in assigned_layers]
 
 
 def _torch_version_at_least(major: int, minor: int) -> bool:
@@ -1489,6 +1486,176 @@ def format_uptime(seconds: float) -> str:
     return f"{hours}h {minutes}m"
 
 
+def _safe_get_json(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 10) -> Optional[Dict[str, Any]]:
+    try:
+        resp = requests.get(url, headers=headers or {}, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _resolve_epoch_id(ps_url: str, task: Optional[Dict[str, Any]], auth_token: Optional[str] = None) -> Optional[int]:
+    if isinstance(task, dict):
+        for key in ("epoch_id", "epoch", "local_epoch"):
+            value = task.get(key)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+    data = _safe_get_json(f"{ps_url}/epoch/current", headers=_auth_headers(auth_token))
+    if not data:
+        return None
+    value = data.get("epoch")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def _lookup_miner_reward(ps_url: str, reward_address: str, epoch: int) -> Dict[str, Any]:
+    details: Dict[str, Any] = {"status": "pending", "amount": None, "source": "none"}
+    if not reward_address:
+        return details
+
+    info = _safe_get_json(f"{ps_url}/miner/{reward_address}", timeout=10)
+    if info:
+        for item in info.get("recent_epochs", []) or []:
+            try:
+                if int(item.get("epoch")) == int(epoch):
+                    details["status"] = "confirmed"
+                    details["amount"] = float(item.get("reward", 0.0))
+                    details["source"] = "miner_endpoint"
+                    return details
+            except Exception:
+                continue
+
+    try:
+        resp = requests.get(f"{ps_url}/epoch/history?limit=20", timeout=10)
+        if resp.status_code == 200:
+            history = resp.json()
+            if isinstance(history, list):
+                for item in history:
+                    if not isinstance(item, dict):
+                        continue
+                    if int(item.get("epoch", -1)) != int(epoch):
+                        continue
+                    rewards = item.get("rewards", {}) or {}
+                    if reward_address in rewards:
+                        details["status"] = "confirmed"
+                        details["amount"] = float(rewards.get(reward_address, 0.0))
+                        details["source"] = "epoch_history"
+                        return details
+    except Exception:
+        pass
+
+    details["source"] = "unavailable"
+    return details
+
+
+def _new_miner_epoch_stats(
+    epoch: int,
+    wallet_address: str,
+    reward_address: str,
+    device: str,
+    precision: str,
+    model_version: int,
+) -> Dict[str, Any]:
+    return {
+        "role": "miner",
+        "epoch": int(epoch),
+        "started_at": time.time(),
+        "started_at_iso": utc_now_iso(),
+        "wallet_address": wallet_address,
+        "reward_address": reward_address,
+        "device": device,
+        "precision": precision,
+        "model_version": int(model_version),
+        "tasks_requested": 0,
+        "tasks_trained": 0,
+        "shards_trained": 0,
+        "batches_trained": 0,
+        "gradients_submitted": 0,
+        "gradients_accepted": 0,
+        "gradients_rejected": 0,
+        "loss_sum": 0.0,
+        "loss_count": 0,
+        "last_task_id": None,
+    }
+
+
+def _emit_miner_epoch_report(report_dir: Path, ps_url: str, stats: Optional[Dict[str, Any]]) -> None:
+    if not stats:
+        return
+
+    report_root = ensure_report_dir(report_dir)
+    epoch = int(stats.get("epoch", -1))
+    reward = _lookup_miner_reward(ps_url, str(stats.get("reward_address", "")), epoch)
+    ended_at = time.time()
+    avg_loss = (
+        float(stats["loss_sum"]) / float(stats["loss_count"])
+        if float(stats.get("loss_count", 0) or 0) > 0
+        else None
+    )
+    summary = {
+        "role": "miner",
+        "epoch": epoch,
+        "started_at": stats.get("started_at_iso"),
+        "ended_at": utc_now_iso(),
+        "duration_seconds": round(max(0.0, ended_at - float(stats.get("started_at", ended_at))), 2),
+        "wallet_address": stats.get("wallet_address"),
+        "reward_address": stats.get("reward_address"),
+        "device": stats.get("device"),
+        "precision": stats.get("precision"),
+        "model_version": stats.get("model_version"),
+        "tasks_requested": int(stats.get("tasks_requested", 0) or 0),
+        "tasks_trained": int(stats.get("tasks_trained", 0) or 0),
+        "shards_trained": int(stats.get("shards_trained", 0) or 0),
+        "batches_trained": int(stats.get("batches_trained", 0) or 0),
+        "gradients_submitted": int(stats.get("gradients_submitted", 0) or 0),
+        "gradients_accepted": int(stats.get("gradients_accepted", 0) or 0),
+        "gradients_rejected": int(stats.get("gradients_rejected", 0) or 0),
+        "avg_loss": round(avg_loss, 6) if avg_loss is not None else None,
+        "reward_status": reward["status"],
+        "reward_amount": reward["amount"],
+        "reward_source": reward["source"],
+        "last_task_id": stats.get("last_task_id"),
+    }
+    append_jsonl(report_root / "miner_epoch_reports.jsonl", summary)
+    write_markdown(
+        report_root / "epochs" / f"miner_epoch_{epoch}.md",
+        [
+            f"# Miner Epoch {epoch}",
+            "",
+            f"- Started: {summary['started_at']}",
+            f"- Ended: {summary['ended_at']}",
+            f"- Duration: {summary['duration_seconds']}s",
+            f"- Device: {summary['device']}",
+            f"- Precision: {summary['precision']}",
+            f"- Model version: {summary['model_version']}",
+            f"- Tasks requested: {summary['tasks_requested']}",
+            f"- Tasks trained: {summary['tasks_trained']}",
+            f"- Shards trained: {summary['shards_trained']}",
+            f"- Batches trained: {summary['batches_trained']}",
+            f"- Gradients submitted: {summary['gradients_submitted']}",
+            f"- Gradients accepted: {summary['gradients_accepted']}",
+            f"- Gradients rejected: {summary['gradients_rejected']}",
+            f"- Average loss: {summary['avg_loss']}",
+            f"- Reward status: {summary['reward_status']}",
+            f"- Reward amount: {summary['reward_amount']}",
+            f"- Reward source: {summary['reward_source']}",
+        ],
+    )
+    print(
+        f"[EpochReport][miner] epoch={epoch} tasks={summary['tasks_trained']} "
+        f"batches={summary['batches_trained']} accepted={summary['gradients_accepted']} "
+        f"reward_status={summary['reward_status']} reward={summary['reward_amount']}"
+    )
+
+
 def download_shard_streaming(ps_url: str, shard_id: int, auth_token: Optional[str] = None) -> Optional[Dict]:
     """Download a single shard using streaming."""
     try:
@@ -1533,11 +1700,11 @@ def train_shard(
     """
     Train model on shard and return gradients from assigned layers.
     
-    Forward pass runs on full model to compute loss.
+    Forward pass runs on the Alice model to compute loss.
     Backward pass only computes gradients for unfrozen (assigned) layers.
-    
+
     Args:
-        model: LlamaNanoModel
+        model: AliceForCausalLM-compatible model
         shard_data: {'tokens': tensor, 'shard_id': int, 'num_tokens': int}
         device: Training device
         assigned_layers: List of layer indices to train
@@ -1850,6 +2017,12 @@ def main():
         choices=["auto", "fp16", "fp32"],
         help="Precision mode selection",
     )
+    parser.add_argument(
+        "--report-dir",
+        type=Path,
+        default=DEFAULT_REPORT_DIR,
+        help="Directory for local miner epoch reports (default: ~/.alice/reports)",
+    )
     args = parser.parse_args()
     args.ps_url = str(args.ps_url).strip().rstrip("/")
 
@@ -1893,6 +2066,7 @@ def main():
     shards_trained = 0
     gradients_accepted = 0
     gradients_rejected = 0
+    current_epoch_stats: Optional[Dict[str, Any]] = None
     profile_path = device_profile_path()
 
     # Never exit on transient errors; only Ctrl+C stops the miner.
@@ -1953,6 +2127,23 @@ def main():
                     pending_task = task
                     break
                 if status == "no_task":
+                    live_epoch = _resolve_epoch_id(args.ps_url, None, auth_token=auth_token)
+                    if current_epoch_stats is None and live_epoch is not None:
+                        current_epoch_stats = _new_miner_epoch_stats(
+                            epoch=live_epoch,
+                            wallet_address=wallet_address,
+                            reward_address=str(args.reward_address or wallet_address),
+                            device=str(capabilities.get("device_type", args.device or "auto")),
+                            precision=str(args.precision or "auto"),
+                            model_version=0,
+                        )
+                    if (
+                        current_epoch_stats is not None
+                        and live_epoch is not None
+                        and int(live_epoch) > int(current_epoch_stats["epoch"])
+                    ):
+                        _emit_miner_epoch_report(Path(args.report_dir), args.ps_url, current_epoch_stats)
+                        current_epoch_stats = None
                     send_heartbeat(args.ps_url, miner_instance_id, capabilities, auth_token=auth_token)
                     time.sleep(10)
                     continue
@@ -2245,11 +2436,36 @@ def main():
 
                 task_id = task["task_id"]
                 shard_id = task["shard_id"]
+                task_epoch = _resolve_epoch_id(args.ps_url, task, auth_token=auth_token)
                 task_nonce = task.get("task_nonce")
                 if not isinstance(task_nonce, str) or not task_nonce.strip():
                     print("❌ Task missing task_nonce, requesting next task...")
                     time.sleep(1)
                     continue
+
+                if task_epoch is not None:
+                    if current_epoch_stats is None:
+                        current_epoch_stats = _new_miner_epoch_stats(
+                            epoch=task_epoch,
+                            wallet_address=wallet_address,
+                            reward_address=str(args.reward_address or wallet_address),
+                            device=device.type,
+                            precision=precision_mode,
+                            model_version=int(ps_version),
+                        )
+                    elif int(task_epoch) != int(current_epoch_stats["epoch"]):
+                        _emit_miner_epoch_report(Path(args.report_dir), args.ps_url, current_epoch_stats)
+                        current_epoch_stats = _new_miner_epoch_stats(
+                            epoch=task_epoch,
+                            wallet_address=wallet_address,
+                            reward_address=str(args.reward_address or wallet_address),
+                            device=device.type,
+                            precision=precision_mode,
+                            model_version=int(ps_version),
+                        )
+                    current_epoch_stats["tasks_requested"] += 1
+                    current_epoch_stats["last_task_id"] = task_id
+                    current_epoch_stats["model_version"] = int(ps_version)
 
                 # Download shard
                 print(f"📥 Downloading shard {shard_id}...")
@@ -2347,6 +2563,12 @@ def main():
 
                 shards_trained += 1
                 tasks_processed += 1
+                if current_epoch_stats is not None:
+                    current_epoch_stats["tasks_trained"] += 1
+                    current_epoch_stats["shards_trained"] += 1
+                    current_epoch_stats["batches_trained"] += int(num_batches)
+                    current_epoch_stats["loss_sum"] += float(avg_loss)
+                    current_epoch_stats["loss_count"] += 1
 
                 if bad_param is not None:
                     invalid_streak += 1
@@ -2390,6 +2612,8 @@ def main():
                 }
 
                 print("📤 Submitting gradient...")
+                if current_epoch_stats is not None:
+                    current_epoch_stats["gradients_submitted"] += 1
                 success = submit_gradient(
                     args.ps_url,
                     task_id,
@@ -2400,6 +2624,8 @@ def main():
                 )
                 if success:
                     gradients_accepted += 1
+                    if current_epoch_stats is not None:
+                        current_epoch_stats["gradients_accepted"] += 1
                     save_device_profile(
                         profile_path,
                         profile_key,
@@ -2457,6 +2683,8 @@ def main():
                     print(f"✅ Task {task_id[:8]}... completed in {train_time:.1f}s\n")
                 else:
                     gradients_rejected += 1
+                    if current_epoch_stats is not None:
+                        current_epoch_stats["gradients_rejected"] += 1
                     print(f"❌ Task {task_id[:8]}... failed\n")
 
                 if tasks_processed % 10 == 0:
@@ -2470,9 +2698,13 @@ def main():
                 time.sleep(2)
 
         except KeyboardInterrupt:
+            _emit_miner_epoch_report(Path(args.report_dir), args.ps_url, current_epoch_stats)
+            current_epoch_stats = None
             print("\n🛑 Miner stopped by user")
             return
         except Exception as e:
+            _emit_miner_epoch_report(Path(args.report_dir), args.ps_url, current_epoch_stats)
+            current_epoch_stats = None
             print(f"❌ Unexpected error: {e}. Restarting in 30s...")
             import traceback
             traceback.print_exc()

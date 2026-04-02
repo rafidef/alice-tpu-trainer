@@ -9,15 +9,7 @@ Current access policy:
 ## Quick Start
 
 ```bash
-python3 scorer/scoring_server.py \
-  --model-path /path/to/current_full.pt \
-  --validation-dir /path/to/validation \
-  --host 0.0.0.0 \
-  --port 8090 \
-  --device cpu \
-  --model-dtype auto \
-  --num-val-shards 5 \
-  --ps-url https://ps.aliceprotocol.org
+./scorer/bootstrap.sh --validation-dir /path/to/validation
 ```
 
 ## Platform Defaults
@@ -26,6 +18,15 @@ python3 scorer/scoring_server.py \
 - Linux x86 `24-32GB RAM`: `float16` fallback, slower
 - Mac ARM `>= 24GB unified memory`: `float16`
 - Windows `>= 32GB RAM`: experimental, `float32`
+
+## Epoch Reports
+
+Scorer epoch reports are written to:
+
+- `~/.alice/reports/scorer_epoch_reports.jsonl`
+- `~/.alice/reports/epochs/scorer_epoch_<epoch>.md`
+
+Each report includes scored submissions, average score latency, model version, and reward status (`confirmed`, `pending`, or `estimate`).
 
 ## Chain Flow
 
@@ -37,3 +38,6 @@ python3 scorer/scoring_server.py \
 
 Current scorer reward pool: `6%`
 
+## Scorer-only checkout
+
+By default, users clone the full `Alice-Protocol` repository. Advanced users who only want scorer files can use git sparse checkout to pull `scorer/`, `shared/`, `core/`, and `docs/` only.

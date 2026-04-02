@@ -11,17 +11,13 @@ Current access policy:
 ### macOS / Linux
 
 ```bash
-cd miner
-./install.sh
-./run_miner.sh --ps-url https://ps.aliceprotocol.org
+./miner/bootstrap.sh
 ```
 
 ### Windows
 
 ```powershell
-cd miner
-.\install.ps1
-.\run_miner.bat --ps-url https://ps.aliceprotocol.org
+.\miner\bootstrap.ps1
 ```
 
 ## Wallet
@@ -41,6 +37,15 @@ python3 miner/alice_miner.py \
   --reward-address aYourRewardAddress
 ```
 
+## Epoch Reports
+
+Miner epoch reports are written to:
+
+- `~/.alice/reports/miner_epoch_reports.jsonl`
+- `~/.alice/reports/epochs/miner_epoch_<epoch>.md`
+
+Each report includes work completed, loss, gradient submission counts, and reward status (`confirmed`, `pending`, or `estimate`).
+
 ## Hardware
 
 See `docs/HARDWARE_REQUIREMENTS.md` for the full matrix.
@@ -51,3 +56,4 @@ Summary:
 - CPU `>= 32GB RAM`: supported but very slow
 - `< 20GB`: not supported
 
+CPU mining is supported but not recommended. Expect roughly `1/50 - 1/100` of GPU throughput and proportionally lower rewards.

@@ -18,10 +18,17 @@ Current rollout state:
 - `scorer/scoring_server.py`
 - `shared/model.py`
 - `shared/__init__.py`
+- `core/reporting.py`
 - model checkpoint
 - validation shard set
 
 ## 3. Start the scorer
+
+```bash
+./scorer/bootstrap.sh --validation-dir /path/to/validation
+```
+
+Optional manual launch:
 
 ```bash
 python3 scorer/scoring_server.py \
@@ -32,7 +39,8 @@ python3 scorer/scoring_server.py \
   --device cpu \
   --model-dtype auto \
   --num-val-shards 5 \
-  --ps-url https://ps.aliceprotocol.org
+  --ps-url https://ps.aliceprotocol.org \
+  --scorer-address aYourScorerAddress
 ```
 
 ## 4. Model sync
@@ -59,3 +67,15 @@ Current scorer reward pool: `6%`
 
 Windows scorer is experimental support. There is no known architecture-level blocker, but it must still pass full validation before public release.
 
+## 7. Epoch reports
+
+Scorer writes local epoch reports to:
+
+- `~/.alice/reports/scorer_epoch_reports.jsonl`
+- `~/.alice/reports/epochs/scorer_epoch_<epoch>.md`
+
+Reward values are labeled as:
+
+- `confirmed`: reward was confirmed from a trusted balance source
+- `pending`: the epoch ended but reward confirmation is not available yet
+- `estimate`: a local estimate is shown and should not be treated as final
