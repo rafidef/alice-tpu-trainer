@@ -60,6 +60,7 @@ class TopKCompressor:
             # Get top-k by magnitude
             abs_flat = flat.abs()
             topk_vals, topk_idx = torch.topk(abs_flat, k)
+            topk_idx = topk_idx.clamp(max=flat.numel() - 1)
 
             # Binary serialization: float16 values + int32 indices
             values_np = flat[topk_idx].to(torch.float16).detach().cpu().numpy().astype(np.float16)
