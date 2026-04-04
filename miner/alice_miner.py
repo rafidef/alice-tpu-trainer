@@ -2481,7 +2481,7 @@ def submit_gradient(
     return "failed"
 
 
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Alice Miner V2 - Tiered Training")
     parser.add_argument("--ps-url", required=True, help="Parameter server URL")
     parser.add_argument("--address", required=True, help="Miner reward/identity address (a1...)")
@@ -2510,6 +2510,14 @@ def main():
     parser.add_argument("--max-batches", type=int, default=10, help="Max batches per shard")
     parser.add_argument("--model-path", type=Path, default=None, help="Pre-downloaded model path (skip download)")
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR, help="Model cache directory (default: ~/.alice/models)")
+    parser.add_argument("--mode", choices=["plan_a", "plan_b"], default="plan_a", help="Training mode")
+    parser.add_argument("--local-lr", type=float, default=0.001, help="Local SGD learning rate for Plan B")
+    parser.add_argument(
+        "--delta-compression-ratio",
+        type=float,
+        default=0.005,
+        help="Plan B TopK delta compression ratio",
+    )
     parser.add_argument("--device", default=None, help="Training device override: cuda|mps|cpu")
     parser.add_argument(
         "--reward-address",
@@ -2542,7 +2550,10 @@ def main():
         dest="use_error_feedback",
         help="Disable Error Feedback.",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def run_plan_a(args: argparse.Namespace) -> None:
     args.ps_url = str(args.ps_url).strip().rstrip("/")
 
     # Fail fast if model runtime is missing; avoids wasting time downloading 13GB then crashing.
@@ -2642,12 +2653,6 @@ def main():
                 print("❌ Runtime registration succeeded but no auth token returned; retrying in 30s...")
                 time.sleep(30)
                 continue
-            heartbeat_stop, heartbeat_re_register, _heartbeat_thread = start_heartbeat_loop(
-                data_plane_url,
-                miner_instance_id,
-                capabilities,
-                auth_token=auth_token,
-            )
 
             # Use first assigned task to learn layer assignment + model version.
             print("📥 Requesting task to get layer assignment...")
@@ -2768,6 +2773,13 @@ def main():
                     print(f"✅ Cached model updated to v{ps_version}: {model_path}")
                 else:
                     print(f"✅ Using cached model: {model_path}")
+
+            heartbeat_stop, heartbeat_re_register, _heartbeat_thread = start_heartbeat_loop(
+                data_plane_url,
+                miner_instance_id,
+                capabilities,
+                auth_token=auth_token,
+            )
 
             # Load state_dict to detect assigned_layers if not set
             print("📦 Loading partial model...")
@@ -3399,6 +3411,17 @@ def main():
             traceback.print_exc()
             time.sleep(30)
             continue
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    if args.mode == "plan_b":
+        from plan_b import run_plan_b
+
+        run_plan_b(args)
+        return
+    run_plan_a(args)
 
 
 if __name__ == "__main__":
