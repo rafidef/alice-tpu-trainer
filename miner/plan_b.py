@@ -405,8 +405,10 @@ class LocalTrainer:
                 _plan_b_log("Epoch update endpoint unavailable; using local model until Day 2")
                 return
             if resp.status_code == 410:
-                _plan_b_log("Epoch update expired; downloading full model")
-                self.download_full_model(target_version)
+                _plan_b_log(
+                    f"Epoch update expired; continuing with local model v{self.current_model_version} "
+                    f"(gap={target_version - self.current_model_version})"
+                )
                 return
             resp.raise_for_status()
             update = _load_update_payload(resp.content)
