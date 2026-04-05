@@ -1672,11 +1672,63 @@ def send_heartbeat(
         return "failed"
 
 
-def start_heartbeat_loop(
+def _new_runtime_auth_state(
     data_plane_url: str,
     miner_id: str,
-    capabilities: Dict,
+    capabilities: Dict[str, Any],
     auth_token: Optional[str],
+) -> Dict[str, Any]:
+    lock = threading.Lock()
+    return {
+        "lock": lock,
+        "data_plane_url": str(data_plane_url),
+        "miner_id": str(miner_id),
+        "capabilities": dict(capabilities),
+        "auth_token": str(auth_token or "").strip(),
+    }
+
+
+def _update_runtime_auth_state(
+    state: Dict[str, Any],
+    *,
+    data_plane_url: Optional[str] = None,
+    miner_id: Optional[str] = None,
+    capabilities: Optional[Dict[str, Any]] = None,
+    auth_token: Optional[str] = None,
+) -> None:
+    with state["lock"]:
+        if data_plane_url is not None:
+            state["data_plane_url"] = str(data_plane_url)
+        if miner_id is not None:
+            state["miner_id"] = str(miner_id)
+        if capabilities is not None:
+            state["capabilities"] = dict(capabilities)
+        if auth_token is not None:
+            state["auth_token"] = str(auth_token or "").strip()
+
+
+def _read_runtime_auth_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    with state["lock"]:
+        return {
+            "data_plane_url": str(state["data_plane_url"]),
+            "miner_id": str(state["miner_id"]),
+            "capabilities": dict(state["capabilities"]),
+            "auth_token": str(state["auth_token"]),
+        }
+
+
+def send_runtime_heartbeat(state: Dict[str, Any]) -> str:
+    snapshot = _read_runtime_auth_state(state)
+    return send_heartbeat(
+        snapshot["data_plane_url"],
+        snapshot["miner_id"],
+        snapshot["capabilities"],
+        auth_token=snapshot["auth_token"],
+    )
+
+
+def start_heartbeat_loop(
+    runtime_auth_state: Dict[str, Any],
     interval_s: int = 60,
 ) -> tuple[threading.Event, threading.Event, threading.Thread]:
     """Keep runtime miner registration alive during long downloads/training."""
@@ -1685,18 +1737,19 @@ def start_heartbeat_loop(
 
     def _heartbeat_loop() -> None:
         while not stop_event.wait(interval_s):
+            snapshot = _read_runtime_auth_state(runtime_auth_state)
             status = send_heartbeat(
-                data_plane_url,
-                miner_id,
-                capabilities,
-                auth_token=auth_token,
+                snapshot["data_plane_url"],
+                snapshot["miner_id"],
+                snapshot["capabilities"],
+                auth_token=snapshot["auth_token"],
             )
             if status == "re_register":
                 print(f"⚠️ Runtime auth rejected on heartbeat, re-registering miner...")
                 re_register_event.set()
                 return
             if status != "ok":
-                print(f"⚠️ Heartbeat failed for runtime endpoint {data_plane_url}")
+                print(f"⚠️ Heartbeat failed for runtime endpoint {snapshot['data_plane_url']}")
 
     thread = threading.Thread(
         target=_heartbeat_loop,
@@ -2661,6 +2714,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
     profile_path = device_profile_path()
     heartbeat_stop: Optional[threading.Event] = None
     heartbeat_re_register: Optional[threading.Event] = None
+    runtime_auth_state: Optional[Dict[str, Any]] = None
 
     # Never exit on transient errors; only Ctrl+C stops the miner.
     while True:
@@ -2714,6 +2768,21 @@ def run_plan_a(args: argparse.Namespace) -> None:
                 print("❌ Runtime registration succeeded but no auth token returned; retrying in 30s...")
                 time.sleep(30)
                 continue
+            if runtime_auth_state is None:
+                runtime_auth_state = _new_runtime_auth_state(
+                    data_plane_url,
+                    miner_instance_id,
+                    capabilities,
+                    auth_token,
+                )
+            else:
+                _update_runtime_auth_state(
+                    runtime_auth_state,
+                    data_plane_url=data_plane_url,
+                    miner_id=miner_instance_id,
+                    capabilities=capabilities,
+                    auth_token=auth_token,
+                )
 
             # Use first assigned task to learn layer assignment + model version.
             print("📥 Requesting task to get layer assignment...")
@@ -2761,12 +2830,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     ):
                         _emit_miner_epoch_report(Path(args.report_dir), control_plane_url, current_epoch_stats)
                         current_epoch_stats = None
-                    heartbeat_status = send_heartbeat(
-                        data_plane_url,
-                        miner_instance_id,
-                        capabilities,
-                        auth_token=auth_token,
-                    )
+                    heartbeat_status = send_runtime_heartbeat(runtime_auth_state)
                     if heartbeat_status == "re_register":
                         print("⚠️ Runtime auth rejected during idle heartbeat, re-registering...")
                         if heartbeat_stop is not None:
@@ -2836,10 +2900,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     print(f"✅ Using cached model: {model_path}")
 
             heartbeat_stop, heartbeat_re_register, _heartbeat_thread = start_heartbeat_loop(
-                data_plane_url,
-                miner_instance_id,
-                capabilities,
-                auth_token=auth_token,
+                runtime_auth_state,
             )
 
             # Load state_dict to detect assigned_layers if not set
@@ -3107,12 +3168,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                         max_attempts=5,
                     )
                     if status == "no_task":
-                        heartbeat_status = send_heartbeat(
-                            data_plane_url,
-                            miner_instance_id,
-                            capabilities,
-                            auth_token=auth_token,
-                        )
+                        heartbeat_status = send_runtime_heartbeat(runtime_auth_state)
                         if heartbeat_status == "re_register":
                             print("⚠️ Runtime auth rejected during idle heartbeat, re-registering...")
                             if heartbeat_stop is not None:
