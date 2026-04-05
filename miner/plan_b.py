@@ -2,9 +2,11 @@
 """Plan B miner runtime with epoch-level local SGD and sparse delta upload."""
 
 import contextlib
+import gc
 import io
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,6 +23,7 @@ PLAN_B_MODEL_DIR = Path.home() / ".alice" / "plan_b_models"
 STATUS_CACHE_TTL_S = 30
 TRAINING_WINDOW_S = 3000
 SUBMIT_WINDOW_S = 600
+MAX_INCREMENTAL_CATCHUP_GAP = 5
 
 
 def _plan_b_log(message: str) -> None:
@@ -33,6 +36,12 @@ def _safe_layer_name(name: str) -> str:
 
 def _normalize_url(url: str) -> str:
     return str(url or "").strip().rstrip("/")
+
+
+DEFAULT_MODEL_QUEUE_BASE_URL = _normalize_url(os.environ.get("ALICE_MODEL_QUEUE_BASE_URL", "https://dl.aliceprotocol.org"))
+DOWNLOAD_QUEUE_POLL_S = max(5, int(os.environ.get("ALICE_MODEL_QUEUE_POLL_S", "30") or 30))
+DOWNLOAD_QUEUE_RETRY_S = max(5, int(os.environ.get("ALICE_MODEL_QUEUE_RETRY_S", "10") or 10))
+DOWNLOAD_QUEUE_HEARTBEAT_S = max(15, int(os.environ.get("ALICE_MODEL_QUEUE_HEARTBEAT_S", "60") or 60))
 
 
 def _extract_tokens(shard_data: Any) -> torch.Tensor:
@@ -51,6 +60,10 @@ def _extract_tokens(shard_data: Any) -> torch.Tensor:
 
 def _load_update_payload(raw_bytes: bytes) -> Dict[str, Any]:
     return torch.load(io.BytesIO(raw_bytes), map_location="cpu", weights_only=True)
+
+
+def _version_marker_path() -> Path:
+    return PLAN_B_MODEL_DIR / "current_version"
 
 
 class LocalTrainer:
@@ -82,9 +95,14 @@ class LocalTrainer:
         self._status_cache: Optional[Dict[str, Any]] = None
         self._status_cache_ts: float = 0.0
         self.epoch_start_time: float = time.time()
+        self.model_queue_base_url = DEFAULT_MODEL_QUEUE_BASE_URL
 
     def mark_epoch_start(self) -> None:
         self.epoch_start_time = time.time()
+
+    def _write_local_version_marker(self, version: int) -> None:
+        PLAN_B_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        _version_marker_path().write_text(str(int(version)))
 
     def _headers(self) -> Dict[str, str]:
         return miner_lib._auth_headers(self.token)
@@ -323,6 +341,132 @@ class LocalTrainer:
     def _full_model_path(self, version: int) -> Path:
         return PLAN_B_MODEL_DIR / f"full_model_v{version}.pt"
 
+    def _download_full_model_direct(self, version: int, model_path: Path) -> None:
+        ok = miner_lib.download_model_streaming(self.ps_url, model_path, auth_token=self.token)
+        if not ok:
+            raise RuntimeError(f"[PLAN-B] Full model download failed for version {version}")
+
+    def _queue_join(self, queue_url: str) -> Optional[Dict[str, Any]]:
+        payload = {
+            "address": self.miner_address,
+            "instance_id": self.miner_instance_id,
+        }
+        try:
+            resp = requests.post(queue_url, json=payload, timeout=10)
+            if resp.status_code != 200:
+                _plan_b_log(f"Queue unavailable ({resp.status_code}), falling back to /model download")
+                return None
+            data = resp.json()
+        except requests.RequestException as exc:
+            _plan_b_log(f"Queue service unreachable ({exc}), falling back to /model download")
+            return None
+        except ValueError as exc:
+            _plan_b_log(f"Queue returned invalid JSON ({exc}), falling back to /model download")
+            return None
+        if not str(data.get("queue_id", "")).strip():
+            _plan_b_log("Queue response missing queue_id, falling back to /model download")
+            return None
+        return data
+
+    def _start_download_queue_heartbeat(self, queue_url: str, download_token: str) -> threading.Event:
+        stop_event = threading.Event()
+
+        def _heartbeat_loop() -> None:
+            while not stop_event.wait(DOWNLOAD_QUEUE_HEARTBEAT_S):
+                try:
+                    requests.post(
+                        f"{queue_url}/heartbeat",
+                        json={"download_token": download_token},
+                        timeout=5,
+                    )
+                except Exception:
+                    # Heartbeat is best-effort; the lease will expire if the queue cannot be reached.
+                    pass
+
+        thread = threading.Thread(
+            target=_heartbeat_loop,
+            daemon=True,
+            name="plan_b_download_queue_heartbeat",
+        )
+        thread.start()
+        return stop_event
+
+    def _complete_download_queue(self, queue_url: str, queue_id: str, download_token: str) -> None:
+        with contextlib.suppress(Exception):
+            requests.post(
+                f"{queue_url}/complete",
+                json={
+                    "queue_id": queue_id,
+                    "download_token": download_token,
+                },
+                timeout=5,
+            )
+
+    def _download_full_model_static(self, version: int, model_path: Path, download_token: str) -> None:
+        model_filename = f"v{version}_full.pt"
+        file_url = f"{self.model_queue_base_url}/models/{model_filename}?token={download_token}"
+        tmp_path = model_path.with_suffix(model_path.suffix + ".tmp")
+        total_bytes = miner_lib._stream_download_with_resume(file_url, tmp_path, timeout_s=600)
+        _ = torch.load(tmp_path, map_location="cpu", mmap=True, weights_only=True)
+        os.replace(tmp_path, model_path)
+        _plan_b_log(f"Static full model download complete: {total_bytes / 1e9:.2f} GB")
+
+    def _download_full_model_queued(self, version: int, model_path: Path) -> None:
+        queue_url = f"{self.model_queue_base_url}/models/queue"
+        data = self._queue_join(queue_url)
+        if data is None:
+            self._download_full_model_direct(version, model_path)
+            return
+
+        queue_id = str(data.get("queue_id", "")).strip()
+        while True:
+            position = int(data.get("position", -1) or -1)
+            if position == 0:
+                download_token = str(data.get("download_token", "")).strip()
+                if not download_token:
+                    _plan_b_log("Queue returned no download token, falling back to /model download")
+                    self._download_full_model_direct(version, model_path)
+                    return
+
+                print("✅ Download slot acquired, starting download...")
+                heartbeat_stop = self._start_download_queue_heartbeat(queue_url, download_token)
+                try:
+                    self._download_full_model_static(version, model_path, download_token)
+                    return
+                except Exception as exc:
+                    _plan_b_log(f"Queued static download failed ({exc}), falling back to /model download")
+                finally:
+                    heartbeat_stop.set()
+                    self._complete_download_queue(queue_url, queue_id, download_token)
+                self._download_full_model_direct(version, model_path)
+                return
+
+            if position < 0 or str(data.get("status", "")).strip().lower() == "not_found":
+                _plan_b_log("Queue ticket expired or queue state was reset, rejoining queue")
+                data = self._queue_join(queue_url)
+                if data is None:
+                    self._download_full_model_direct(version, model_path)
+                    return
+                queue_id = str(data.get("queue_id", "")).strip()
+                continue
+
+            wait_seconds = max(0, int(data.get("wait_seconds", DOWNLOAD_QUEUE_POLL_S) or DOWNLOAD_QUEUE_POLL_S))
+            print(f"⏳ Download queue: position #{position} (~{wait_seconds // 60} min)")
+            time.sleep(DOWNLOAD_QUEUE_POLL_S)
+            try:
+                resp = requests.get(queue_url, params={"queue_id": queue_id}, timeout=10)
+                if resp.status_code == 404:
+                    data = {"status": "not_found", "position": -1}
+                    continue
+                if resp.status_code != 200:
+                    print("[DOWNLOAD] Queue check failed, retrying...")
+                    time.sleep(DOWNLOAD_QUEUE_RETRY_S)
+                    continue
+                data = resp.json()
+            except requests.RequestException:
+                print("[DOWNLOAD] Queue check failed, retrying...")
+                time.sleep(DOWNLOAD_QUEUE_RETRY_S)
+
     def _find_best_local_model(self, target_version: Optional[int]) -> Optional[int]:
         best_version: Optional[int] = None
         for path in PLAN_B_MODEL_DIR.glob("full_model_v*.pt"):
@@ -374,31 +518,47 @@ class LocalTrainer:
             torch.set_default_dtype(prev_dtype)
         model.load_state_dict(state_dict, strict=False)
         del state_dict
+        gc.collect()
+        if self.device.type in ("cuda", "mps") and precision_mode != "fp32":
+            model = model.half()
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
-        return model.to(self.device)
+        with torch.no_grad():
+            for param in model.parameters():
+                param.data = param.data.to(self.device)
+            for buf in model.buffers():
+                buf.data = buf.data.to(self.device)
+        return model
 
     def download_full_model(self, version: Optional[int] = None) -> int:
         target_version = int(version if version is not None else self._current_ps_model_version() or 0)
         model_path = self._full_model_path(target_version)
         if not model_path.exists():
             _plan_b_log(f"Downloading full model for version {target_version}")
-            ok = miner_lib.download_model_streaming(self.ps_url, model_path, auth_token=self.token)
-            if not ok:
-                raise RuntimeError("[PLAN-B] Full model download failed")
+            self._download_full_model_queued(target_version, model_path)
         else:
             _plan_b_log(f"Using cached full model: {model_path}")
         state_dict = torch.load(model_path, map_location="cpu", mmap=True, weights_only=True)
         self.model = self._load_model_from_state_dict(state_dict)
         self.current_model_version = target_version
+        self._write_local_version_marker(target_version)
         _plan_b_log(f"Loaded full model v{target_version}")
         return target_version
 
     def apply_epoch_updates(self) -> None:
         target_version = self._current_ps_model_version()
+        if target_version is None:
+            return
         if self.model is None or self.current_model_version is None:
             local_version = self._find_best_local_model(target_version)
             if local_version is None:
+                self.download_full_model(target_version)
+                return
+            initial_gap = target_version - local_version
+            if initial_gap > MAX_INCREMENTAL_CATCHUP_GAP:
+                _plan_b_log(
+                    f"Local v{local_version} too far behind PS v{target_version}, downloading fresh model"
+                )
                 self.download_full_model(target_version)
                 return
             _plan_b_log(
@@ -408,8 +568,10 @@ class LocalTrainer:
         if target_version is None or target_version <= self.current_model_version:
             return
         gap = target_version - self.current_model_version
-        if gap > 20:
-            _plan_b_log(f"Model gap {gap} > 20, falling back to full model download")
+        if gap > MAX_INCREMENTAL_CATCHUP_GAP:
+            _plan_b_log(
+                f"Local v{self.current_model_version} too far behind PS v{target_version}, downloading fresh model"
+            )
             self.download_full_model(target_version)
             return
 
@@ -431,10 +593,11 @@ class LocalTrainer:
                 return
             if resp.status_code == 410:
                 _plan_b_log(
-                    f"Epoch update expired; continuing with local model v{self.current_model_version} "
-                    f"(gap={target_version - self.current_model_version})"
+                    f"Epoch update v{from_version + 1} expired from local v{self.current_model_version}; "
+                    f"downloading fresh full model"
                 )
-                return
+                self.download_full_model(target_version)
+                continue
             resp.raise_for_status()
             update = _load_update_payload(resp.content)
             if self.model is None:
@@ -452,6 +615,7 @@ class LocalTrainer:
                     param_flat = param.data.view(-1)
                     param_flat[indices.to(param.device)] += values.to(param.device)
             self.current_model_version = int(update.get("new_version", from_version + 1))
+            self._write_local_version_marker(self.current_model_version)
             _plan_b_log(f"Applied sparse epoch update v{self.current_model_version}")
 
     def epoch_ending(self) -> bool:
@@ -558,6 +722,12 @@ def run_plan_b(args: Any) -> None:
             auth_token = str(register_response.get("token", "")).strip()
             if not auth_token:
                 raise RuntimeError("[PLAN-B] Registration returned empty auth token")
+            runtime_auth_state = miner_lib._build_runtime_auth_state(
+                data_plane_url,
+                miner_instance_id,
+                capabilities,
+                auth_token,
+            )
 
             device = torch.device(capabilities["device_type"])
             trainer = LocalTrainer(
@@ -572,10 +742,7 @@ def run_plan_b(args: Any) -> None:
             )
             trainer.apply_epoch_updates()
             heartbeat_stop, heartbeat_re_register, _thread = miner_lib.start_heartbeat_loop(
-                data_plane_url,
-                miner_instance_id,
-                capabilities,
-                auth_token=auth_token,
+                runtime_auth_state,
             )
 
             while True:

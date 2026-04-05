@@ -1688,6 +1688,21 @@ def _new_runtime_auth_state(
     }
 
 
+def _build_runtime_auth_state(
+    data_plane_url: str,
+    miner_id: str,
+    capabilities: Dict[str, Any],
+    auth_token: Optional[str],
+) -> Dict[str, Any]:
+    """Backward-compatible alias for older Plan B callers."""
+    return _new_runtime_auth_state(
+        data_plane_url,
+        miner_id,
+        capabilities,
+        auth_token,
+    )
+
+
 def _update_runtime_auth_state(
     state: Dict[str, Any],
     *,
