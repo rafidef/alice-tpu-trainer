@@ -26,6 +26,7 @@ SUBMIT_WINDOW_S = 600
 MAX_INCREMENTAL_CATCHUP_GAP = 5
 BATCH_RESTORE_SUCCESS_SHARDS = 3
 MAX_OOM_RETRIES_AT_BATCH1 = 3
+MODEL_INFO_CACHE_TTL_S = 15
 
 
 def _plan_b_log(message: str) -> None:
@@ -40,9 +41,47 @@ def _normalize_url(url: str) -> str:
     return str(url or "").strip().rstrip("/")
 
 
+def _coerce_version(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+    return None
+
+
+def _pick_first_version(*values: Any) -> Optional[int]:
+    for value in values:
+        parsed = _coerce_version(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_url_candidates(raw_value: Any) -> List[str]:
+    urls: List[str] = []
+    if isinstance(raw_value, list):
+        for item in raw_value:
+            url = _normalize_url(item)
+            if url and url not in urls:
+                urls.append(url)
+    elif isinstance(raw_value, str):
+        for part in raw_value.split(","):
+            url = _normalize_url(part)
+            if url and url not in urls:
+                urls.append(url)
+    return urls
+
+
 MODEL_MIRRORS = [
     "https://huggingface.co/v102ss/alice-7b-model/resolve/main",
     "https://dl.aliceprotocol.org/models",
+]
+EPOCH_UPDATE_MIRRORS = [
+    "https://dl.aliceprotocol.org/epoch_updates",
 ]
 
 
@@ -100,6 +139,8 @@ class LocalTrainer:
         self._last_batch_log: Optional[Tuple[int, int, str]] = None
         self._status_cache: Optional[Dict[str, Any]] = None
         self._status_cache_ts: float = 0.0
+        self._model_info_cache: Optional[Dict[str, Any]] = None
+        self._model_info_cache_ts: float = 0.0
         self.epoch_start_time: float = time.time()
 
     def mark_epoch_start(self) -> None:
@@ -443,6 +484,28 @@ class LocalTrainer:
         self._status_cache_ts = now
         return {}
 
+    def _fetch_model_info(self, force: bool = False) -> Dict[str, Any]:
+        now = time.time()
+        if not force and self._model_info_cache is not None and (now - self._model_info_cache_ts) < MODEL_INFO_CACHE_TTL_S:
+            return self._model_info_cache
+        try:
+            resp = requests.get(
+                f"{self.ps_url}/model/info",
+                headers=self._headers(),
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict):
+                    self._model_info_cache = data
+                    self._model_info_cache_ts = now
+                    return data
+        except Exception:
+            pass
+        self._model_info_cache = {}
+        self._model_info_cache_ts = now
+        return {}
+
     def _current_ps_model_version(self) -> Optional[int]:
         status = self._fetch_status(force=True)
         for key in ("model_version", "version", "current_version"):
@@ -456,17 +519,69 @@ class LocalTrainer:
     def _full_model_path(self, version: int) -> Path:
         return PLAN_B_MODEL_DIR / f"full_model_v{version}.pt"
 
+    def _epoch_update_path(self, version: int) -> Path:
+        return PLAN_B_MODEL_DIR / f"update_v{version}.pt"
+
+    def _publication_state(self, force: bool = False) -> Dict[str, Any]:
+        status = self._fetch_status(force=force)
+        info = self._fetch_model_info(force=force)
+
+        target_version = _pick_first_version(
+            info.get("live_version"),
+            status.get("model_version"),
+            info.get("model_version"),
+            info.get("version"),
+            status.get("version"),
+            status.get("current_version"),
+        ) or 0
+        bootstrap_version = _pick_first_version(
+            info.get("published_full_version"),
+            info.get("version"),
+            target_version,
+        ) or target_version
+        published_update_version = _pick_first_version(
+            info.get("published_update_version"),
+            target_version,
+        ) or target_version
+        if target_version > 0:
+            bootstrap_version = max(0, min(bootstrap_version, target_version))
+            published_update_version = max(0, min(published_update_version, target_version))
+
+        full_model_base_urls = _parse_url_candidates(info.get("full_model_base_urls"))
+        if not full_model_base_urls:
+            full_model_base_urls = list(MODEL_MIRRORS)
+
+        epoch_update_base_urls = _parse_url_candidates(info.get("epoch_update_base_urls"))
+        if not epoch_update_base_urls:
+            epoch_update_base_urls = list(EPOCH_UPDATE_MIRRORS)
+
+        return {
+            "status": status,
+            "info": info,
+            "target_version": target_version,
+            "bootstrap_version": bootstrap_version,
+            "published_update_version": published_update_version,
+            "full_model_base_urls": full_model_base_urls,
+            "epoch_update_base_urls": epoch_update_base_urls,
+        }
+
     def _download_full_model_direct(self, version: int, model_path: Path) -> None:
         ok = miner_lib.download_model_streaming(self.ps_url, model_path, auth_token=self.token)
         if not ok:
             raise RuntimeError(f"[PLAN-B] Full model download failed for version {version}")
 
-    def _download_full_model_from_mirrors(self, version: int, model_path: Path) -> None:
+    def _download_full_model_from_mirrors(
+        self,
+        version: int,
+        model_path: Path,
+        mirror_urls: Optional[List[str]] = None,
+    ) -> None:
         model_filename = f"v{version}_full.pt"
         tmp_path = model_path.with_suffix(model_path.suffix + ".tmp")
         last_error: Optional[Exception] = None
+        mirrors = mirror_urls or list(MODEL_MIRRORS)
 
-        for mirror in MODEL_MIRRORS:
+        for mirror in mirrors:
             file_url = f"{mirror.rstrip('/')}/{model_filename}"
             _plan_b_log(f"[DOWNLOAD] Trying {file_url}")
             try:
@@ -488,6 +603,106 @@ class LocalTrainer:
         if last_error is not None:
             _plan_b_log("[DOWNLOAD] All mirrors failed, falling back to PS /model")
         self._download_full_model_direct(version, model_path)
+
+    def _load_epoch_update_from_path(self, path: Path) -> Dict[str, Any]:
+        return torch.load(path, map_location="cpu", weights_only=True)
+
+    def _download_epoch_update_from_mirrors(
+        self,
+        version: int,
+        base_urls: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        update_path = self._epoch_update_path(version)
+        tmp_path = update_path.with_suffix(update_path.suffix + ".tmp")
+        if update_path.exists():
+            try:
+                return self._load_epoch_update_from_path(update_path)
+            except Exception as exc:
+                _plan_b_log(f"[DOWNLOAD] Cached epoch update v{version} invalid, re-downloading: {exc}")
+                with contextlib.suppress(FileNotFoundError):
+                    update_path.unlink()
+
+        for base_url in base_urls:
+            file_url = f"{base_url.rstrip('/')}/update_v{version}.pt"
+            _plan_b_log(f"[DOWNLOAD] Trying epoch update mirror {file_url}")
+            try:
+                with contextlib.suppress(FileNotFoundError):
+                    tmp_path.unlink()
+                total_bytes = miner_lib._stream_download_with_resume(file_url, tmp_path, timeout_s=600)
+                update = self._load_epoch_update_from_path(tmp_path)
+                os.replace(tmp_path, update_path)
+                _plan_b_log(
+                    f"[DOWNLOAD] Epoch update mirror download complete: v{version} {total_bytes / 1e6:.1f} MB"
+                )
+                return update
+            except Exception as exc:
+                _plan_b_log(f"[DOWNLOAD] Epoch update mirror failed: {exc}")
+                with contextlib.suppress(FileNotFoundError):
+                    tmp_path.unlink()
+        return None
+
+    def _download_epoch_update_from_ps(self, from_version: int, version: int) -> Optional[Dict[str, Any]]:
+        update_path = self._epoch_update_path(version)
+        tmp_path = update_path.with_suffix(update_path.suffix + ".tmp")
+        try:
+            with requests.get(
+                f"{self.ps_url}/model/epoch_update",
+                params={"from_version": from_version},
+                headers=self._headers(),
+                timeout=600,
+                stream=True,
+            ) as resp:
+                if resp.status_code in (404, 501):
+                    _plan_b_log("Epoch update endpoint unavailable; using local model until next retry")
+                    return None
+                if resp.status_code == 410:
+                    raise RuntimeError("expired")
+                resp.raise_for_status()
+
+                with contextlib.suppress(FileNotFoundError):
+                    tmp_path.unlink()
+                with open(tmp_path, "wb") as handle:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        handle.write(chunk)
+
+            update = self._load_epoch_update_from_path(tmp_path)
+            os.replace(tmp_path, update_path)
+            _plan_b_log(f"[DOWNLOAD] Epoch update fallback download complete: v{version}")
+            return update
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            _plan_b_log(f"Epoch update request failed, keeping current model: {exc}")
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+            return None
+
+    def _apply_epoch_update_payload(self, update: Dict[str, Any], from_version: int) -> None:
+        if self.model is None:
+            raise RuntimeError("Plan B model unexpectedly missing")
+
+        named_params = dict(self.model.named_parameters())
+        with torch.no_grad():
+            for chunk in update.get("chunks", []):
+                name = chunk.get("name")
+                param = named_params.get(name)
+                if param is None:
+                    continue
+                indices = chunk["indices"].long()
+                values = chunk["values"].float()
+                param_flat = param.data.view(-1)
+                param_flat[indices.to(param.device)] += values.to(param.device)
+        self.current_model_version = int(update.get("new_version", from_version + 1))
+        self._write_local_version_marker(self.current_model_version)
+        _plan_b_log(f"Applied sparse epoch update v{self.current_model_version}")
+
+    def _select_full_download_version(self, target_version: int, bootstrap_version: int) -> int:
+        if bootstrap_version > 0 and target_version - bootstrap_version <= MAX_INCREMENTAL_CATCHUP_GAP:
+            return bootstrap_version
+        return target_version
+
 
     def _find_best_local_model(self, target_version: Optional[int]) -> Optional[int]:
         marker_version = self._read_local_version_marker()
@@ -557,12 +772,25 @@ class LocalTrainer:
                 buf.data = buf.data.to(self.device)
         return model
 
-    def download_full_model(self, version: Optional[int] = None) -> int:
-        target_version = int(version if version is not None else self._current_ps_model_version() or 0)
+    def download_full_model(
+        self,
+        version: Optional[int] = None,
+        mirror_urls: Optional[List[str]] = None,
+    ) -> int:
+        publication = self._publication_state(force=True)
+        target_version = int(
+            version
+            if version is not None
+            else publication.get("bootstrap_version") or publication.get("target_version") or 0
+        )
         model_path = self._full_model_path(target_version)
         if not model_path.exists():
             _plan_b_log(f"Downloading full model for version {target_version}")
-            self._download_full_model_from_mirrors(target_version, model_path)
+            self._download_full_model_from_mirrors(
+                target_version,
+                model_path,
+                mirror_urls=mirror_urls or publication.get("full_model_base_urls"),
+            )
         else:
             _plan_b_log(f"Using cached full model: {model_path}")
         state_dict = torch.load(model_path, map_location="cpu", mmap=True, weights_only=True)
@@ -573,20 +801,27 @@ class LocalTrainer:
         return target_version
 
     def apply_epoch_updates(self) -> None:
-        target_version = self._current_ps_model_version()
+        publication = self._publication_state(force=True)
+        target_version = int(publication.get("target_version") or 0)
+        bootstrap_version = int(publication.get("bootstrap_version") or 0)
+        published_update_version = int(publication.get("published_update_version") or 0)
+        full_model_base_urls = list(publication.get("full_model_base_urls") or MODEL_MIRRORS)
+        epoch_update_base_urls = list(publication.get("epoch_update_base_urls") or EPOCH_UPDATE_MIRRORS)
         if target_version is None:
             return
         if self.model is None or self.current_model_version is None:
             local_version = self._find_best_local_model(target_version)
             if local_version is None:
-                self.download_full_model(target_version)
+                full_version = self._select_full_download_version(target_version, bootstrap_version)
+                self.download_full_model(full_version, mirror_urls=full_model_base_urls)
                 return
             initial_gap = target_version - local_version
             if initial_gap > MAX_INCREMENTAL_CATCHUP_GAP:
                 _plan_b_log(
                     f"Local v{local_version} too far behind PS v{target_version}, downloading fresh model"
                 )
-                self.download_full_model(target_version)
+                full_version = self._select_full_download_version(target_version, bootstrap_version)
+                self.download_full_model(full_version, mirror_urls=full_model_base_urls)
                 return
             _plan_b_log(
                 f"Found local model v{local_version}, loading instead of downloading v{target_version}"
@@ -594,56 +829,50 @@ class LocalTrainer:
             self.download_full_model(version=local_version)
         if target_version is None or target_version <= self.current_model_version:
             return
-        gap = target_version - self.current_model_version
+        available_update_version = min(target_version, max(0, published_update_version))
+        gap = available_update_version - self.current_model_version
         if gap > MAX_INCREMENTAL_CATCHUP_GAP:
             _plan_b_log(
-                f"Local v{self.current_model_version} too far behind PS v{target_version}, downloading fresh model"
+                f"Local v{self.current_model_version} too far behind published updates v{available_update_version}, downloading fresh model"
             )
-            self.download_full_model(target_version)
+            full_version = self._select_full_download_version(target_version, bootstrap_version)
+            self.download_full_model(full_version, mirror_urls=full_model_base_urls)
             return
 
         while self.current_model_version is not None and target_version is not None and self.current_model_version < target_version:
             from_version = int(self.current_model_version)
-            try:
-                resp = requests.get(
-                    f"{self.ps_url}/model/epoch_update",
-                    params={"from_version": from_version},
-                    headers=self._headers(),
-                    timeout=120,
-                )
-            except Exception as exc:
-                _plan_b_log(f"Epoch update request failed, keeping current model: {exc}")
+            next_version = from_version + 1
+            if published_update_version < next_version:
+                if published_update_version < target_version:
+                    _plan_b_log(
+                        f"Published epoch updates currently stop at v{published_update_version}; waiting to catch up to live v{target_version}"
+                    )
                 return
 
-            if resp.status_code in (404, 501):
-                _plan_b_log("Epoch update endpoint unavailable; using local model until Day 2")
+            update = self._download_epoch_update_from_mirrors(next_version, epoch_update_base_urls)
+            if update is None:
+                try:
+                    update = self._download_epoch_update_from_ps(from_version, next_version)
+                except RuntimeError as exc:
+                    if str(exc) != "expired":
+                        raise
+                    _plan_b_log(
+                        f"Epoch update v{next_version} expired from local v{self.current_model_version}; downloading fresh full model"
+                    )
+                    full_version = self._select_full_download_version(target_version, bootstrap_version)
+                    self.download_full_model(full_version, mirror_urls=full_model_base_urls)
+                    return
+            if update is None:
                 return
-            if resp.status_code == 410:
+
+            if update.get("old_version") not in (None, from_version):
                 _plan_b_log(
-                    f"Epoch update v{from_version + 1} expired from local v{self.current_model_version}; "
-                    f"downloading fresh full model"
+                    f"Epoch update payload mismatch for v{next_version}; expected old_version={from_version}, got {update.get('old_version')}"
                 )
-                self.download_full_model(target_version)
-                continue
-            resp.raise_for_status()
-            update = _load_update_payload(resp.content)
-            if self.model is None:
-                raise RuntimeError("Plan B model unexpectedly missing")
-
-            named_params = dict(self.model.named_parameters())
-            with torch.no_grad():
-                for chunk in update.get("chunks", []):
-                    name = chunk.get("name")
-                    param = named_params.get(name)
-                    if param is None:
-                        continue
-                    indices = chunk["indices"].long()
-                    values = chunk["values"].float()
-                    param_flat = param.data.view(-1)
-                    param_flat[indices.to(param.device)] += values.to(param.device)
-            self.current_model_version = int(update.get("new_version", from_version + 1))
-            self._write_local_version_marker(self.current_model_version)
-            _plan_b_log(f"Applied sparse epoch update v{self.current_model_version}")
+                full_version = self._select_full_download_version(target_version, bootstrap_version)
+                self.download_full_model(full_version, mirror_urls=full_model_base_urls)
+                return
+            self._apply_epoch_update_payload(update, from_version)
 
     def epoch_ending(self) -> bool:
         status = self._fetch_status()

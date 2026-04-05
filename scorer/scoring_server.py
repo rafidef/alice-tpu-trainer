@@ -34,6 +34,7 @@ import sys
 import json
 import time
 import gc
+import contextlib
 import struct
 import zlib
 import base64
@@ -85,6 +86,78 @@ SAFE_MAX_SEQ_LEN = int(os.environ.get("ALICE_SAFE_MAX_SEQ_LEN", "2048"))
 VALIDATION_SEQ_LEN = int(os.environ.get("ALICE_VALIDATION_SEQ_LEN", "128"))
 VALIDATION_BATCHES_PER_SHARD = int(os.environ.get("ALICE_VALIDATION_BATCHES_PER_SHARD", "1"))
 DEFAULT_REPORT_DIR = Path.home() / ".alice" / "reports"
+MODEL_INFO_CACHE_TTL_S = 15
+MAX_INCREMENTAL_CATCHUP_GAP = 10
+FULL_MODEL_MIRRORS = [
+    "https://huggingface.co/v102ss/alice-7b-model/resolve/main",
+    "https://dl.aliceprotocol.org/models",
+]
+EPOCH_UPDATE_MIRRORS = [
+    "https://dl.aliceprotocol.org/epoch_updates",
+]
+
+
+def _normalize_url(url: str) -> str:
+    return str(url or "").strip().rstrip("/")
+
+
+def _coerce_version(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+    return None
+
+
+def _pick_first_version(*values: Any) -> Optional[int]:
+    for value in values:
+        parsed = _coerce_version(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_url_candidates(raw_value: Any) -> list[str]:
+    urls: list[str] = []
+    if isinstance(raw_value, list):
+        for item in raw_value:
+            url = _normalize_url(str(item or ""))
+            if url and url not in urls:
+                urls.append(url)
+    elif isinstance(raw_value, str):
+        for part in raw_value.split(","):
+            url = _normalize_url(part)
+            if url and url not in urls:
+                urls.append(url)
+    return urls
+
+
+def _stream_download_with_resume(file_url: str, tmp_path: Path, timeout_s: int = 600) -> int:
+    downloaded = tmp_path.stat().st_size if tmp_path.exists() else 0
+    headers: Dict[str, str] = {}
+    mode = "wb"
+    if downloaded > 0:
+        headers["Range"] = f"bytes={downloaded}-"
+        mode = "ab"
+
+    with requests.get(file_url, headers=headers, stream=True, timeout=timeout_s) as resp:
+        if downloaded > 0 and resp.status_code == 200:
+            downloaded = 0
+            mode = "wb"
+        elif resp.status_code not in (200, 206):
+            resp.raise_for_status()
+
+        with open(tmp_path, mode) as handle:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                downloaded += len(chunk)
+    return downloaded
 
 
 def _read_cpu_model() -> str:
@@ -651,6 +724,8 @@ class ScoringServer:
         self._current_epoch_stats: Optional[Dict[str, Any]] = None
         self._last_balance_total: Optional[float] = None
         self._report_state_path = self.report_dir / "scorer_runtime_state.json"
+        self._model_info_cache: Optional[Dict[str, Any]] = None
+        self._model_info_cache_ts: float = 0.0
 
         if self.scorer_address and self.ps_url:
             state = self._load_report_state()
@@ -1096,15 +1171,76 @@ class ScoringServer:
                 log.error(f"[AUTO-UPDATE] loop error: {e}", exc_info=True)
             time.sleep(300)  # 5 minutes
 
-    def _check_and_apply_updates(self):
-        """Check PS model version; pull deltas or full model if behind.
+    def _fetch_model_info(self, force: bool = False) -> Dict[str, Any]:
+        now = time.time()
+        if not force and self._model_info_cache is not None and (now - self._model_info_cache_ts) < MODEL_INFO_CACHE_TTL_S:
+            return self._model_info_cache
 
-        When busy (scoring a gradient), we still fetch deltas into
+        try:
+            resp = requests.get(f"{self.ps_url}/model/info", timeout=60)
+            if resp.status_code != 200:
+                log.warning(f"[AUTO-UPDATE] /model/info returned {resp.status_code}")
+                self._model_info_cache = {}
+            else:
+                info = resp.json()
+                self._model_info_cache = info if isinstance(info, dict) else {}
+        except Exception as exc:
+            log.warning(f"[AUTO-UPDATE] failed to reach PS: {exc}")
+            self._model_info_cache = {}
+
+        self._model_info_cache_ts = now
+        return self._model_info_cache or {}
+
+    def _publication_state(self, force: bool = False) -> Dict[str, Any]:
+        info = self._fetch_model_info(force=force)
+        live_version = _pick_first_version(
+            info.get("live_version"),
+            info.get("model_version"),
+            info.get("version"),
+            self.model_version,
+        ) or int(self.model_version or 0)
+        published_full_version = _pick_first_version(
+            info.get("published_full_version"),
+            info.get("version"),
+            live_version,
+        ) or live_version
+        published_update_version = _pick_first_version(
+            info.get("published_update_version"),
+            live_version,
+        ) or live_version
+        if live_version > 0:
+            published_full_version = max(0, min(published_full_version, live_version))
+            published_update_version = max(0, min(published_update_version, live_version))
+
+        full_model_base_urls = _parse_url_candidates(info.get("full_model_base_urls"))
+        if not full_model_base_urls:
+            full_model_base_urls = list(FULL_MODEL_MIRRORS)
+
+        epoch_update_base_urls = _parse_url_candidates(info.get("epoch_update_base_urls"))
+        if not epoch_update_base_urls:
+            epoch_update_base_urls = list(EPOCH_UPDATE_MIRRORS)
+
+        return {
+            "info": info,
+            "live_version": live_version,
+            "published_full_version": published_full_version,
+            "published_update_version": published_update_version,
+            "full_model_base_urls": full_model_base_urls,
+            "epoch_update_base_urls": epoch_update_base_urls,
+        }
+
+    def _select_full_download_version(self, live_version: int, published_full_version: int) -> int:
+        if published_full_version > 0 and live_version - published_full_version <= MAX_INCREMENTAL_CATCHUP_GAP:
+            return published_full_version
+        return live_version
+
+    def _check_and_apply_updates(self):
+        """Check PS model version; pull epoch updates or full model if behind.
+
+        When busy (scoring a gradient), we still fetch epoch updates into
         ``_pending_deltas`` so the download happens in parallel with scoring.
         The lightweight apply step runs once the worker is free.
         """
-        import requests as _requests  # stdlib-compat, no new dep
-
         # --- watchdog: auto-reset stuck busy flag ---
         if self.busy:
             stuck_for = time.time() - self._busy_since
@@ -1112,138 +1248,186 @@ class ScoringServer:
                 log.warning(f"[AUTO-UPDATE] Busy watchdog: stuck for {stuck_for:.0f}s, force-releasing")
                 self.busy = False
 
-        # --- apply any previously fetched deltas if now free ---
+        # --- apply any previously fetched updates if now free ---
         if not self.busy and self._pending_deltas:
-            log.info(f"[AUTO-UPDATE] Applying {len(self._pending_deltas)} pending delta(s)")
+            log.info(f"[AUTO-UPDATE] Applying {len(self._pending_deltas)} pending epoch update(s)")
             for from_ver, payload in self._pending_deltas:
                 if from_ver != self.model_version:
-                    log.warning(f"[AUTO-UPDATE] pending delta v{from_ver} != current v{self.model_version}, discarding")
+                    log.warning(f"[AUTO-UPDATE] pending update v{from_ver} != current v{self.model_version}, discarding")
                     break
                 if not self._apply_delta(payload, from_ver):
-                    log.warning(f"[AUTO-UPDATE] pending delta apply failed at v{from_ver}")
+                    log.warning(f"[AUTO-UPDATE] pending epoch update apply failed at v{from_ver}")
                     break
             else:
-                log.info(f"[AUTO-UPDATE] ✅ Pending deltas applied → v{self.model_version}")
+                log.info(f"[AUTO-UPDATE] ✅ Pending epoch updates applied → v{self.model_version}")
             self._pending_deltas.clear()
             return
 
-        # --- check PS for new version ---
-        try:
-            resp = _requests.get(f"{self.ps_url}/model/info", timeout=60)
-            if resp.status_code != 200:
-                log.warning(f"[AUTO-UPDATE] /model/info returned {resp.status_code}")
-                return
-            info = resp.json()
-        except Exception as e:
-            log.warning(f"[AUTO-UPDATE] failed to reach PS: {e}")
-            return
-
-        ps_version = info.get("model_version")
-        if ps_version is None:
-            ps_version = info.get("version", 0)
-        if ps_version <= self.model_version:
+        publication = self._publication_state(force=True)
+        live_version = int(publication["live_version"] or 0)
+        published_full_version = int(publication["published_full_version"] or 0)
+        published_update_version = int(publication["published_update_version"] or 0)
+        if live_version <= self.model_version:
             return  # Already up to date
 
-        gap = ps_version - self.model_version
-        log.info(f"[AUTO-UPDATE] PS v{ps_version} > local v{self.model_version} (gap={gap})")
+        gap = live_version - self.model_version
+        log.info(f"[AUTO-UPDATE] PS live v{live_version} > local v{self.model_version} (gap={gap})")
 
-        if gap > 10:
+        if gap > MAX_INCREMENTAL_CATCHUP_GAP:
             if self.busy:
-                log.info(f"[AUTO-UPDATE] gap={gap} > 10, need full download but busy — defer")
+                log.info(f"[AUTO-UPDATE] gap={gap} > {MAX_INCREMENTAL_CATCHUP_GAP}, need full download but busy — defer")
                 return
-            log.info(f"[AUTO-UPDATE] gap={gap} > 10, downloading full model...")
-            self._download_full_model_sync(ps_version)
+            full_version = self._select_full_download_version(live_version, published_full_version)
+            log.info(f"[AUTO-UPDATE] gap={gap} large, downloading full model v{full_version}...")
+            self._download_full_model_sync(
+                full_version,
+                full_model_base_urls=publication["full_model_base_urls"] if full_version == published_full_version else None,
+                allow_ps_fallback=True,
+            )
+            return
+
+        available_update_version = min(live_version, published_update_version)
+        if available_update_version <= self.model_version:
+            if published_update_version < live_version:
+                log.info(
+                    f"[AUTO-UPDATE] Waiting for published epoch updates: published_update_version={published_update_version}, live_version={live_version}"
+                )
+            return
+
+        fetched = []
+        current = self.model_version
+        for v in range(current, available_update_version):
+            delta = self._fetch_delta(v, publication["epoch_update_base_urls"])
+            if delta is None:
+                log.warning(f"[AUTO-UPDATE] epoch update fetch from v{v} failed")
+                if not self.busy:
+                    full_version = self._select_full_download_version(live_version, published_full_version)
+                    log.info(f"[AUTO-UPDATE] falling back to full download v{full_version}")
+                    self._download_full_model_sync(
+                        full_version,
+                        full_model_base_urls=publication["full_model_base_urls"] if full_version == published_full_version else None,
+                        allow_ps_fallback=True,
+                    )
+                return
+            fetched.append((v, delta))
+
+        if self.busy:
+            self._pending_deltas = fetched
+            log.info(f"[AUTO-UPDATE] Fetched {len(fetched)} epoch update(s), stashed (worker busy)")
         else:
-            # Fetch deltas — allowed even while busy (IO only, no model mutation)
-            fetched = []
-            current = self.model_version
-            for v in range(current, ps_version):
-                delta = self._fetch_delta(v)
-                if delta is None:
-                    log.warning(f"[AUTO-UPDATE] delta fetch from v{v} failed")
-                    if not self.busy:
-                        log.info("[AUTO-UPDATE] falling back to full download")
-                        self._download_full_model_sync(ps_version)
+            for from_ver, payload in fetched:
+                if not self._apply_delta(payload, from_ver):
+                    full_version = self._select_full_download_version(live_version, published_full_version)
+                    log.warning(f"[AUTO-UPDATE] epoch update apply v{from_ver} failed, falling back to full download v{full_version}")
+                    self._download_full_model_sync(
+                        full_version,
+                        full_model_base_urls=publication["full_model_base_urls"] if full_version == published_full_version else None,
+                        allow_ps_fallback=True,
+                    )
                     return
-                fetched.append((v, delta))
+            log.info(f"[AUTO-UPDATE] ✅ Incremental update complete → v{self.model_version}")
 
-            if self.busy:
-                self._pending_deltas = fetched
-                log.info(f"[AUTO-UPDATE] Fetched {len(fetched)} delta(s), stashed (worker busy)")
-            else:
-                for from_ver, payload in fetched:
-                    if not self._apply_delta(payload, from_ver):
-                        log.warning(f"[AUTO-UPDATE] delta apply v{from_ver} failed, falling back to full download")
-                        self._download_full_model_sync(ps_version)
-                        return
-                log.info(f"[AUTO-UPDATE] ✅ Incremental update complete → v{self.model_version}")
+        if published_update_version < live_version and self.model_version < live_version:
+            log.info(
+                f"[AUTO-UPDATE] Live version is ahead of published epoch updates; local v{self.model_version}, published_update_version={published_update_version}, live_version={live_version}"
+            )
 
-    def _fetch_delta(self, from_version: int) -> dict | None:
-        """Fetch a single delta payload from PS (IO only, no model mutation)."""
-        import requests as _requests
+    def _fetch_delta(self, from_version: int, update_base_urls: list[str]) -> dict | None:
+        """Fetch a single epoch update payload, preferring VPS3 static files."""
+        next_version = from_version + 1
+        update_path = self._baseline_dir / f"update_v{next_version}.pt"
+        tmp_path = Path(f"{update_path}.tmp")
+
+        if update_path.exists():
+            try:
+                return torch.load(update_path, map_location="cpu", weights_only=True)
+            except Exception as exc:
+                log.warning(f"[AUTO-UPDATE] cached epoch update v{next_version} invalid, re-downloading: {exc}")
+                with contextlib.suppress(FileNotFoundError):
+                    update_path.unlink()
+
+        for base_url in update_base_urls:
+            file_url = f"{base_url.rstrip('/')}/update_v{next_version}.pt"
+            try:
+                with contextlib.suppress(FileNotFoundError):
+                    tmp_path.unlink()
+                total_bytes = _stream_download_with_resume(file_url, tmp_path, timeout_s=600)
+                payload = torch.load(tmp_path, map_location="cpu", weights_only=True)
+                os.replace(tmp_path, update_path)
+                log.info(f"[AUTO-UPDATE] Fetched epoch update v{next_version} from mirror ({total_bytes / 1e6:.1f}MB)")
+                return payload
+            except Exception as exc:
+                log.warning(f"[AUTO-UPDATE] static epoch update failed ({file_url}): {exc}")
+                with contextlib.suppress(FileNotFoundError):
+                    tmp_path.unlink()
 
         try:
             headers = {}
             token = self._ensure_ps_token()
             if token:
                 headers["Authorization"] = f"Bearer {token}"
-            resp = _requests.get(
-                f"{self.ps_url}/model/delta",
+            resp = requests.get(
+                f"{self.ps_url}/model/epoch_update",
                 params={"from_version": from_version},
                 headers=headers,
-                timeout=120,
+                timeout=600,
+                stream=True,
             )
-            if resp.status_code in (401, 403):
-                log.warning(f"[AUTO-UPDATE] delta from v{from_version}: HTTP {resp.status_code}, refreshing token")
-                token = self._ensure_ps_token(force_refresh=True)
-                headers = {"Authorization": f"Bearer {token}"} if token else {}
-                resp = _requests.get(
-                    f"{self.ps_url}/model/delta",
-                    params={"from_version": from_version},
-                    headers=headers,
-                    timeout=120,
-                )
-            if resp.status_code != 200:
-                log.warning(f"[AUTO-UPDATE] delta from v{from_version}: HTTP {resp.status_code}")
-                return None
+            try:
+                if resp.status_code == 410:
+                    log.warning(f"[AUTO-UPDATE] epoch update v{next_version} expired on PS")
+                    return None
+                if resp.status_code != 200:
+                    log.warning(f"[AUTO-UPDATE] epoch update from v{from_version}: HTTP {resp.status_code}")
+                    return None
 
-            return resp.json()
+                with contextlib.suppress(FileNotFoundError):
+                    tmp_path.unlink()
+                with open(tmp_path, "wb") as handle:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        handle.write(chunk)
+            finally:
+                resp.close()
+
+            payload = torch.load(tmp_path, map_location="cpu", weights_only=True)
+            os.replace(tmp_path, update_path)
+            log.info(f"[AUTO-UPDATE] Fetched epoch update v{next_version} from PS fallback")
+            return payload
         except Exception as e:
-            log.warning(f"[AUTO-UPDATE] delta fetch failed: {e}")
+            log.warning(f"[AUTO-UPDATE] epoch update fetch failed: {e}")
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
             return None
 
     def _fetch_and_apply_delta(self, from_version: int) -> bool:
         """Fetch single delta from PS and apply to in-memory model."""
-        delta = self._fetch_delta(from_version)
+        delta = self._fetch_delta(from_version, list(EPOCH_UPDATE_MIRRORS))
         if delta is None:
             return False
         return self._apply_delta(delta, from_version)
 
     def _apply_delta(self, delta_payload: dict, from_version: int) -> bool:
         """
-        Apply compressed delta to the in-memory model.
-        delta_payload is binary_v2 compressed format (same as miner gradients).
-        Uses decompress_gradients_sparse (already in this file) then scatters to model params.
+        Apply an epoch update payload to the in-memory model.
         """
         try:
-            # decompress_gradients_sparse returns {name: {indices, values, shape}}
-            sparse_delta = decompress_gradients_sparse(delta_payload)
-
             with self._model_lock:
                 param_dict = dict(self.model.named_parameters())
                 updated = 0
-                for name, sdata in sparse_delta.items():
+                for chunk in delta_payload.get("chunks", []):
+                    name = chunk.get("name")
                     param = param_dict.get(name)
                     if param is None:
                         continue
-                    indices = sdata["indices"]
-                    values = sdata["values"].to(param.dtype).to(param.device)
-                    # Scatter into dense parameter
+                    indices = chunk["indices"].long()
+                    values = chunk["values"].float().to(param.dtype).to(param.device)
                     flat = param.data.view(-1)
                     flat[indices.to(param.device)] += values
                     updated += 1
 
-                self.model_version = from_version + 1
+                self.model_version = int(delta_payload.get("new_version", from_version + 1))
                 self._scored_results.clear()  # Invalidate scoring cache
 
             log.info(f"[AUTO-UPDATE] Applied delta v{from_version}→v{self.model_version}, {updated} params updated")
@@ -1255,31 +1439,51 @@ class ScoringServer:
             log.error(f"[AUTO-UPDATE] _apply_delta failed: {e}", exc_info=True)
             return False
 
-    def _download_full_model_sync(self, target_version: int):
-        """Download full model from PS and hot-reload (blocking, runs in bg thread)."""
-        import requests as _requests
-
+    def _download_full_model_sync(
+        self,
+        target_version: int,
+        full_model_base_urls: Optional[list[str]] = None,
+        allow_ps_fallback: bool = True,
+    ):
+        """Download full model from mirrors first, then PS fallback."""
         model_dir = Path(os.environ.get("MODEL_DIR", "/tmp/alice-models"))
         model_dir.mkdir(parents=True, exist_ok=True)
         dest = model_dir / f"model_v{target_version}.pt"
-        tmp_path = str(dest) + ".downloading"
+        tmp_path = Path(str(dest) + ".downloading")
+        last_error: Optional[Exception] = None
 
-        # Get download URL from PS
-        try:
-            info_resp = _requests.get(f"{self.ps_url}/model/info", timeout=60)
-            info = info_resp.json() if info_resp.status_code == 200 else {}
-            download_url = info.get("download_url", "")
-            if not download_url:
-                download_url = f"{self.ps_url}/models/v{target_version}_full.pt"
-            elif download_url.startswith("/"):
-                download_url = f"{self.ps_url}{download_url}"
-        except Exception:
-            download_url = f"{self.ps_url}/models/v{target_version}_full.pt"
+        if full_model_base_urls:
+            model_name = f"v{target_version}_full.pt"
+            for base_url in full_model_base_urls:
+                download_url = f"{base_url.rstrip('/')}/{model_name}"
+                log.info(f"[AUTO-UPDATE] Trying full model mirror {download_url}")
+                try:
+                    with contextlib.suppress(FileNotFoundError):
+                        tmp_path.unlink()
+                    downloaded = _stream_download_with_resume(download_url, tmp_path, timeout_s=3600)
+                    _ = torch.load(tmp_path, map_location="cpu", mmap=True, weights_only=True)
+                    os.replace(tmp_path, str(dest))
+                    log.info(f"[AUTO-UPDATE] Downloaded {downloaded/1e6:.1f}MB → {dest}")
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    log.warning(f"[AUTO-UPDATE] full model mirror failed ({download_url}): {exc}")
+                    with contextlib.suppress(FileNotFoundError):
+                        tmp_path.unlink()
+            else:
+                if not allow_ps_fallback:
+                    return
+        if not dest.exists():
+            if not allow_ps_fallback:
+                return
+            download_url = f"{self.ps_url}/model"
+            log.info(f"[AUTO-UPDATE] Downloading full model v{target_version} from {download_url}")
 
-        log.info(f"[AUTO-UPDATE] Downloading full model v{target_version} from {download_url}")
-
-        try:
-            resp = _requests.get(download_url, stream=True, timeout=3600)
+            try:
+                resp = requests.get(download_url, stream=True, timeout=3600)
+            except Exception as exc:
+                log.error(f"[AUTO-UPDATE] Full model download failed: {exc}")
+                return
             if resp.status_code != 200:
                 log.error(f"[AUTO-UPDATE] Full model download failed: HTTP {resp.status_code}")
                 return
@@ -1299,9 +1503,12 @@ class ScoringServer:
                             log.info(f"[AUTO-UPDATE] Download: {downloaded/1e6:.0f}MB")
                         last_log = downloaded
 
-            os.replace(tmp_path, str(dest))
+            os.replace(str(tmp_path), str(dest))
             log.info(f"[AUTO-UPDATE] Downloaded {downloaded/1e6:.1f}MB → {dest}")
+        elif last_error is not None:
+            log.info(f"[AUTO-UPDATE] Full model mirror path succeeded after earlier failure: {last_error}")
 
+        try:
             if not self._promote_checkpoint_baseline(str(dest), target_version):
                 log.warning(f"[AUTO-UPDATE] Full model v{target_version} loaded but baseline promotion failed")
                 return

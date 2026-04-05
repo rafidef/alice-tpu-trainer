@@ -1964,6 +1964,8 @@ def _download_partial_model_from_nginx(
         file_url = f"{base_url}/{file_name}"
         print(f"📥 Static model source {idx}/{len(base_urls)}: {file_url}")
         try:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
             # Cache hit: reuse same file if byte size matches.
             if model_path.exists():
                 with contextlib.suppress(Exception):
@@ -1983,7 +1985,8 @@ def _download_partial_model_from_nginx(
         except Exception as exc:
             last_error = exc
             print(f"⚠️ Static source failed ({file_url}): {exc}")
-            # Keep tmp_path for resume on same URL retry in next outer attempt.
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
             continue
 
     if last_error is not None:
