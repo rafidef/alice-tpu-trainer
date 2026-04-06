@@ -46,6 +46,54 @@ class PlanBHotfixTests(unittest.TestCase):
         trainer._download_epoch_update_from_mirrors.assert_not_called()
         trainer._download_epoch_update_from_ps.assert_not_called()
 
+    def test_wait_for_next_epoch_skips_wait_when_local_matches_live_full_model(self) -> None:
+        trainer = plan_b.LocalTrainer.__new__(plan_b.LocalTrainer)
+        trainer.current_model_version = 150
+        trainer._publication_state = mock.Mock(
+            return_value={
+                "target_version": 150,
+                "published_full_version": 150,
+                "published_update_version": 140,
+            }
+        )
+
+        with mock.patch.object(plan_b.time, "sleep") as sleep_mock:
+            plan_b.wait_for_next_epoch(trainer, poll_interval_s=1)
+
+        sleep_mock.assert_not_called()
+
+    def test_wait_for_next_epoch_skips_wait_when_no_newer_published_artifact_exists(self) -> None:
+        trainer = plan_b.LocalTrainer.__new__(plan_b.LocalTrainer)
+        trainer.current_model_version = 150
+        trainer._publication_state = mock.Mock(
+            return_value={
+                "target_version": 149,
+                "published_full_version": 149,
+                "published_update_version": 140,
+            }
+        )
+
+        with mock.patch.object(plan_b.time, "sleep") as sleep_mock:
+            plan_b.wait_for_next_epoch(trainer, poll_interval_s=1)
+
+        sleep_mock.assert_not_called()
+
+    def test_wait_for_next_epoch_still_waits_for_newer_published_version(self) -> None:
+        trainer = plan_b.LocalTrainer.__new__(plan_b.LocalTrainer)
+        trainer.current_model_version = 149
+        trainer._publication_state = mock.Mock(
+            return_value={
+                "target_version": 150,
+                "published_full_version": 150,
+                "published_update_version": 140,
+            }
+        )
+
+        with mock.patch.object(plan_b.time, "sleep") as sleep_mock:
+            plan_b.wait_for_next_epoch(trainer, poll_interval_s=1)
+
+        sleep_mock.assert_called_once_with(1)
+
 
 if __name__ == "__main__":
     unittest.main()

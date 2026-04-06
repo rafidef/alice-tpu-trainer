@@ -1053,6 +1053,29 @@ def wait_for_next_epoch(trainer: LocalTrainer, poll_interval_s: int = 15) -> Non
     start_version = trainer.current_model_version
     if start_version is None:
         return
+    start_version = int(start_version)
+
+    def _should_skip_wait(publication: Dict[str, Any]) -> bool:
+        published_update_version = int(publication.get("published_update_version") or 0)
+        published_full_version = int(publication.get("published_full_version") or 0)
+        live_version = int(publication.get("target_version") or 0)
+        newest_published_version = max(published_update_version, published_full_version)
+
+        if start_version == live_version == published_full_version:
+            _plan_b_log(f"Already at latest version v{start_version}, starting next epoch")
+            return True
+        if published_update_version < start_version and newest_published_version <= start_version:
+            _plan_b_log(
+                f"Published updates stop at v{published_update_version} while local is v{start_version}; "
+                "no newer published artifact available, starting next epoch"
+            )
+            return True
+        return False
+
+    publication = trainer._publication_state(force=True)
+    if _should_skip_wait(publication):
+        return
+
     waited_s = 0
     while True:
         time.sleep(poll_interval_s)
@@ -1060,7 +1083,9 @@ def wait_for_next_epoch(trainer: LocalTrainer, poll_interval_s: int = 15) -> Non
         publication = trainer._publication_state(force=True)
         published_update_version = int(publication.get("published_update_version") or 0)
         published_full_version = int(publication.get("published_full_version") or 0)
-        if max(published_update_version, published_full_version) > int(start_version):
+        if _should_skip_wait(publication):
+            return
+        if max(published_update_version, published_full_version) > start_version:
             _plan_b_log(
                 f"Detected published next version: full={published_full_version}, "
                 f"update={published_update_version}, local={start_version}"
