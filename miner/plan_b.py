@@ -17,6 +17,8 @@ import torch
 
 import alice_miner as miner_lib
 
+miner_lib.configure_timestamp_logging()
+
 
 SNAPSHOT_DIR = Path.home() / ".alice" / "global_snapshot"
 DELTA_OUTBOX_DIR = Path.home() / ".alice" / "delta_outbox"
@@ -31,7 +33,7 @@ MODEL_INFO_CACHE_TTL_S = 15
 
 
 def _plan_b_log(message: str) -> None:
-    print(f"[PLAN-B] {message}")
+    miner_lib.tprint(f"[PLAN-B] {message}")
 
 
 def _safe_layer_name(name: str) -> str:
@@ -238,7 +240,7 @@ class LocalTrainer:
         ps_cap = max(1, int(self.assigned_batch_size or 0) or 2)
         user_override = int(getattr(self.args, "batch_size", 0) or 0)
         if user_override > 0:
-            return max(1, min(user_override, ps_cap))
+            return max(1, user_override)
         return ps_cap
 
     def _log_batch_decision(self, source: str) -> None:
@@ -254,20 +256,15 @@ class LocalTrainer:
         )
 
     def update_task_batch_size(self, task: Dict[str, Any]) -> int:
-        previous_assigned = self.assigned_batch_size
         raw_assigned = int((task or {}).get("assigned_batch_size", 0) or 0)
         self.assigned_batch_size = raw_assigned if raw_assigned > 0 else 2
         target_batch = self._target_batch_size()
         user_override = int(getattr(self.args, "batch_size", 0) or 0)
         source = "ps_assignment"
         if user_override > 0:
-            source = "manual_override_capped"
-        if previous_assigned is None or previous_assigned != self.assigned_batch_size:
-            self.effective_batch_size = target_batch
-            self.stable_shards_at_current_batch = 0
-        elif self.effective_batch_size <= 0 or self.effective_batch_size > target_batch:
-            self.effective_batch_size = target_batch
-            self.stable_shards_at_current_batch = 0
+            source = "fixed_user_selection"
+        self.effective_batch_size = target_batch
+        self.stable_shards_at_current_batch = 0
         self._log_batch_decision(source)
         return target_batch
 
@@ -376,23 +373,15 @@ class LocalTrainer:
                         if not self._is_oom_error(exc):
                             raise
                         self._clear_device_cache()
-                        old_batch_size = current_batch_size
-                        new_batch_size = max(1, current_batch_size // 2)
                         self.stable_shards_at_current_batch = 0
-                        if new_batch_size == current_batch_size:
-                            oom_retries_at_batch1 += 1
-                            _plan_b_log(
-                                f"OOM at batch_size={current_batch_size}; retry {oom_retries_at_batch1}/{MAX_OOM_RETRIES_AT_BATCH1}"
-                            )
-                            if oom_retries_at_batch1 >= MAX_OOM_RETRIES_AT_BATCH1:
-                                _plan_b_log("Repeated OOM at batch_size=1, skipping shard")
-                                self.effective_batch_size = 1
-                                return None, 1, False
-                        else:
-                            current_batch_size = new_batch_size
-                            oom_retries_at_batch1 = 0
-                            self.effective_batch_size = new_batch_size
-                            _plan_b_log(f"OOM detected, reducing batch size: {old_batch_size} -> {new_batch_size}")
+                        oom_retries_at_batch1 += 1
+                        _plan_b_log(
+                            f"⚠️ OOM detected, but keeping your selected batch={current_batch_size}. "
+                            "If this persists, restart with a smaller batch size."
+                        )
+                        self.effective_batch_size = current_batch_size
+                        if oom_retries_at_batch1 >= 1:
+                            return None, current_batch_size, False
                         should_retry = True
                         break
             finally:
@@ -410,16 +399,7 @@ class LocalTrainer:
                 return None, current_batch_size, False
 
             self.effective_batch_size = current_batch_size
-            self.stable_shards_at_current_batch += 1
-            target_batch_size = self._target_batch_size()
-            if self.stable_shards_at_current_batch >= BATCH_RESTORE_SUCCESS_SHARDS and current_batch_size < target_batch_size:
-                restored_batch_size = min(current_batch_size * 2, target_batch_size)
-                if restored_batch_size != current_batch_size:
-                    _plan_b_log(
-                        f"Batch size restored after stable training: {current_batch_size} -> {restored_batch_size}"
-                    )
-                    self.effective_batch_size = restored_batch_size
-                    self.stable_shards_at_current_batch = 0
+            self.stable_shards_at_current_batch = 0
 
             avg_loss = total_loss / num_batches
             _plan_b_log(
@@ -811,6 +791,43 @@ class LocalTrainer:
             return bootstrap_version
         return target_version
 
+    def _release_loaded_model(self) -> None:
+        if self.model is None:
+            return
+        old_version = self.current_model_version
+        old_model = self.model
+        self.model = None
+        self.current_model_version = None
+        del old_model
+        gc.collect()
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            with contextlib.suppress(Exception):
+                torch.cuda.empty_cache()
+            with contextlib.suppress(Exception):
+                torch.cuda.ipc_collect()
+        _plan_b_log(f"Released in-memory full model v{old_version}")
+
+    def _cleanup_model_cache(self, keep_versions: int = 1) -> None:
+        keep_versions = max(1, int(keep_versions))
+        versions: List[Tuple[int, Path]] = []
+        for path in PLAN_B_MODEL_DIR.glob("full_model_v*.pt"):
+            try:
+                version = int(path.stem.split("_v", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            versions.append((version, path))
+        versions.sort(key=lambda item: item[0], reverse=True)
+        keep_paths = {path for _, path in versions[:keep_versions]}
+        for _, path in versions[keep_versions:]:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+            _plan_b_log(f"Removed stale cached full model: {path.name}")
+        for tmp_path in PLAN_B_MODEL_DIR.glob("full_model_v*.pt.tmp"):
+            if tmp_path in keep_paths:
+                continue
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+            _plan_b_log(f"Removed stale partial full model: {tmp_path.name}")
 
     def _find_best_local_model(self, target_version: Optional[int]) -> Optional[int]:
         marker_version = self._read_local_version_marker()
@@ -892,6 +909,14 @@ class LocalTrainer:
             else publication.get("bootstrap_version") or publication.get("target_version") or 0
         )
         model_path = self._full_model_path(target_version)
+        if self.model is not None and self.current_model_version == target_version:
+            _plan_b_log(f"Full model v{target_version} already loaded")
+            return target_version
+        if self.model is not None:
+            _plan_b_log(
+                f"Switching full model v{self.current_model_version} -> v{target_version}; releasing old model first"
+            )
+            self._release_loaded_model()
         if not model_path.exists():
             _plan_b_log(f"Downloading full model for version {target_version}")
             self._download_full_model_from_mirrors(
@@ -905,6 +930,7 @@ class LocalTrainer:
         self.model = self._load_model_from_state_dict(state_dict)
         self.current_model_version = target_version
         self._write_local_version_marker(target_version)
+        self._cleanup_model_cache(keep_versions=1)
         _plan_b_log(f"Loaded full model v{target_version}")
         return target_version
 

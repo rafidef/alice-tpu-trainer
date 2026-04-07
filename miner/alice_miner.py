@@ -8,6 +8,7 @@ Requests tasks from PS, downloads shards on-demand, trains assigned layers, and 
 
 import argparse
 import base64
+import builtins
 import contextlib
 try:
     import fcntl  # POSIX
@@ -55,6 +56,7 @@ DEVICE_PROFILE_PATH = Path.home() / ".alice" / "device_profile.json"
 DEVICE_PROFILE_VERSION = 1
 PIDFILE_PATH = Path.home() / ".alice" / "miner.pid"
 DEFAULT_REPORT_DIR = Path.home() / ".alice" / "reports"
+BATCH_CONFIG_PATH = Path.home() / ".alice" / "batch_config.json"
 
 MAX_DELTA_HOPS = 10
 KEEP_VERSIONS = 2
@@ -67,6 +69,151 @@ DIRECT_ASSIGNMENT_RECHECK_S = 300
 MEASURED_MODEL_PARAMS = 7_000_000_000
 MEASURED_MODEL_PARAMS_B = MEASURED_MODEL_PARAMS / 1_000_000_000.0
 MEASURED_TFLOPS_EMA_ALPHA = 0.35
+
+
+def configure_timestamp_logging() -> None:
+    logging.basicConfig(
+        format="%(asctime)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=logging.INFO,
+    )
+
+
+def tprint(*args: Any, **kwargs: Any) -> None:
+    builtins.print(f"[{time.strftime('%H:%M:%S')}]", *args, **kwargs)
+
+
+configure_timestamp_logging()
+print = tprint
+
+
+def _batch_size_arg(value: str) -> int:
+    batch_size = int(value)
+    if batch_size < 1 or batch_size > 32:
+        raise argparse.ArgumentTypeError("batch size must be between 1 and 32")
+    return batch_size
+
+
+def _normalize_gpu_name(gpu_name: str) -> str:
+    return " ".join(str(gpu_name or "").strip().lower().split())
+
+
+def _batch_config_matches(config: Dict[str, Any], detected_gpu: str, detected_mem_gb: float) -> bool:
+    saved_gpu = _normalize_gpu_name(config.get("gpu", ""))
+    if not saved_gpu:
+        return False
+    if saved_gpu != _normalize_gpu_name(detected_gpu):
+        return False
+    saved_mem = float(config.get("mem_gb", 0.0) or 0.0)
+    return abs(saved_mem - float(detected_mem_gb)) < 1.0
+
+
+def load_batch_config(path: Path = BATCH_CONFIG_PATH) -> Optional[Dict[str, Any]]:
+    try:
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save_batch_config(
+    batch_size: int,
+    gpu: str,
+    mem_gb: float,
+    path: Path = BATCH_CONFIG_PATH,
+    *,
+    selected_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload = {
+        "batch_size": int(max(1, min(32, batch_size))),
+        "gpu": str(gpu or "").strip(),
+        "mem_gb": float(mem_gb),
+        "selected_at": selected_at or utc_now_iso(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    return payload
+
+
+def _select_batch_size(
+    detected_gpu: str,
+    detected_mem_gb: float,
+    *,
+    input_func=input,
+    interactive: Optional[bool] = None,
+) -> int:
+    options = [
+        (1, 12, "12-16 GB", "RTX 3060, RTX 4070"),
+        (4, 20, "20-24 GB", "RTX 3090, RTX 4090 24GB"),
+        (8, 32, "32-40 GB", "RTX 4090 48GB, A6000, M3 Max"),
+        (16, 48, "48-64 GB", "A6000 48GB, M2 Ultra"),
+        (32, 80, "80+ GB", "A100, H100"),
+    ]
+    recommended = 1
+    for batch_size, min_mem_gb, _, _ in options:
+        if detected_mem_gb >= min_mem_gb:
+            recommended = batch_size
+
+    if interactive is None:
+        interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
+    if not interactive:
+        tprint(
+            f"Using recommended batch size: {recommended} "
+            f"(detected {detected_gpu}, non-interactive startup)"
+        )
+        return recommended
+
+    print("\n=== Alice Miner Batch Size ===\n")
+    print(f"  Detected: {detected_gpu} ({detected_mem_gb:.0f} GB)\n")
+    for idx, (batch_size, _, mem_range, examples) in enumerate(options, start=1):
+        marker = " <- recommended" if batch_size == recommended else ""
+        print(f"  [{idx}] batch={batch_size:2d}  ({mem_range}, e.g. {examples}){marker}")
+    print(
+        f"\n  Enter 1-{len(options)}, or press Enter for recommended (batch={recommended}): ",
+        end="",
+    )
+
+    try:
+        choice = str(input_func() or "").strip()
+        if choice == "":
+            return recommended
+        idx = int(choice) - 1
+        if 0 <= idx < len(options):
+            return options[idx][0]
+    except Exception:
+        pass
+    return recommended
+
+
+def resolve_batch_size(
+    cli_batch_size: Optional[int],
+    detected_gpu: str,
+    detected_mem_gb: float,
+    *,
+    config_path: Path = BATCH_CONFIG_PATH,
+    input_func=input,
+    interactive: Optional[bool] = None,
+) -> int:
+    if cli_batch_size is not None:
+        return int(cli_batch_size)
+    saved = load_batch_config(config_path)
+    if saved and _batch_config_matches(saved, detected_gpu, detected_mem_gb):
+        saved_batch = int(max(1, min(32, int(saved.get("batch_size", 1) or 1))))
+        saved_at = str(saved.get("selected_at", "unknown") or "unknown")
+        tprint(f"Using saved batch size: {saved_batch} (from {saved_at})")
+        tprint(f"To change: delete {config_path} or use --batch-size N")
+        return saved_batch
+    selected = _select_batch_size(
+        detected_gpu,
+        detected_mem_gb,
+        input_func=input_func,
+        interactive=interactive,
+    )
+    save_batch_config(selected, detected_gpu, detected_mem_gb, config_path)
+    tprint(f"Saved batch size: {selected} -> {config_path}")
+    return selected
 
 def auto_detect_device() -> Tuple[str, float, str]:
     """Auto-detect best available device and memory."""
@@ -2617,34 +2764,28 @@ def train_shard(
         except torch.cuda.OutOfMemoryError:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
-            new_batch_size = max(1, current_batch_size // 2)
-            if new_batch_size != current_batch_size:
-                current_batch_size = new_batch_size
-                print(f"⚠️ OOM, reducing batch size to {current_batch_size}")
-            else:
-                oom_retries_at_bs1 += 1
-                print("⚠️ OOM at batch_size=1, retrying...")
-                if oom_retries_at_bs1 >= 3:
-                    print("⚠️ Repeated OOM at batch_size=1, aborting shard.")
-                    oom_aborted = True
-                    break
+            oom_retries_at_bs1 += 1
+            print(
+                f"⚠️ OOM detected, but keeping your selected batch={current_batch_size}. "
+                "If this persists, restart with a smaller batch size."
+            )
+            if oom_retries_at_bs1 >= 1:
+                oom_aborted = True
+                break
             model.zero_grad(set_to_none=True)
             continue
         except RuntimeError as exc:
             if "out of memory" in str(exc).lower():
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
-                new_batch_size = max(1, current_batch_size // 2)
-                if new_batch_size != current_batch_size:
-                    current_batch_size = new_batch_size
-                    print(f"⚠️ OOM, reducing batch size to {current_batch_size}")
-                else:
-                    oom_retries_at_bs1 += 1
-                    print("⚠️ OOM at batch_size=1, retrying...")
-                    if oom_retries_at_bs1 >= 3:
-                        print("⚠️ Repeated OOM at batch_size=1, aborting shard.")
-                        oom_aborted = True
-                        break
+                oom_retries_at_bs1 += 1
+                print(
+                    f"⚠️ OOM detected, but keeping your selected batch={current_batch_size}. "
+                    "If this persists, restart with a smaller batch size."
+                )
+                if oom_retries_at_bs1 >= 1:
+                    oom_aborted = True
+                    break
                 model.zero_grad(set_to_none=True)
                 continue
             raise
@@ -2806,9 +2947,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--batch-size",
-        type=int,
+        type=_batch_size_arg,
         default=None,
-        help="Manual batch size cap override (normally assigned by PS)",
+        help="Fixed batch size (1-32). Overrides auto-detect.",
     )
     parser.add_argument(
         "--lr",
@@ -2940,7 +3081,6 @@ def run_plan_a(args: argparse.Namespace) -> None:
 
             runtime_seq_len = int(profile.get("stable_seq_len", args.seq_len))
             runtime_seq_len = max(64, min(int(args.seq_len), runtime_seq_len))
-            profile_batch_cap = int(profile.get("stable_batch_cap", 0))
             last_oom_ts = float(profile.get("last_oom_ts", 0.0))
             last_upgrade_ts = float(profile.get("last_upgrade_ts", 0.0))
             oom_abort_streak = 0
@@ -3238,29 +3378,19 @@ def run_plan_a(args: argparse.Namespace) -> None:
             setup_tiered_training(model, assigned_layers, n_layers=n_layers)
 
             model_memory_gb = sum(p.numel() * p.element_size() for p in model.parameters()) / 1e9
-            batch_size_cap, available_gb, per_sample_gb = calculate_batch_size(
+            auto_batch_size, available_gb, per_sample_gb = calculate_batch_size(
                 device_type=device.type,
                 model_memory_gb=model_memory_gb,
                 total_memory_gb=total_memory_gb,
                 seq_len=runtime_seq_len,
             )
-            dynamic_batch_size = conservative_start_batch(device.type, batch_size_cap)
+            fixed_batch_size = int(args.batch_size or auto_batch_size or 1)
+            fixed_batch_size = max(1, min(32, fixed_batch_size))
+            batch_size_cap = fixed_batch_size
+            dynamic_batch_size = fixed_batch_size
             if ps_assigned_batch_cap > 0:
-                batch_size_cap = max(1, min(batch_size_cap, ps_assigned_batch_cap))
-                dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
-                print(f"📊 Batch size cap assigned by PS: {batch_size_cap}")
-            else:
-                batch_size_cap = max(1, min(batch_size_cap, 2))
-                dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
-                print(f"📊 Fallback batch size cap (no PS assignment): {batch_size_cap}")
-            if args.batch_size is not None and args.batch_size > 0:
-                batch_size_cap = max(1, min(batch_size_cap, args.batch_size))
-                dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
-                print(f"📊 Manual --batch-size override applied: {batch_size_cap}")
-            if profile_batch_cap > 0:
-                batch_size_cap = max(1, min(batch_size_cap, profile_batch_cap))
-                dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
-                print(f"📊 Batch size cap restored from profile: {batch_size_cap}")
+                print(f"📊 PS assigned batch_size: {ps_assigned_batch_cap}")
+            print(f"📊 Fixed batch size selected: {fixed_batch_size}")
             print(format_device_log_line(capabilities))
             expected_layers = calculate_layers(float(capabilities.get("memory_gb", total_memory_gb)), device.type)
             precision = precision_mode.upper()
@@ -3270,12 +3400,12 @@ def run_plan_a(args: argparse.Namespace) -> None:
             print(f"   Memory: {total_memory_gb:.1f} GB")
             print(f"   Layers: {len(assigned_layers)} (auto-calculated)")
             print(
-                f"   Batch size: {dynamic_batch_size} "
+                f"   Batch size: {fixed_batch_size} "
                 f"(available: {available_gb:.1f}GB, per_sample: {per_sample_gb:.1f}GB)"
             )
-            print(f"   Batch cap: {batch_size_cap} (gradual ramp enabled)")
+            print(f"   Auto estimate: {auto_batch_size}")
             if ps_assigned_batch_cap > 0:
-                print(f"   PS batch cap: {ps_assigned_batch_cap}")
+                print(f"   PS batch assignment: {ps_assigned_batch_cap}")
             print(f"   Precision: {precision}")
             print(f"   Gradient scale: {args.lr}")
             print(f"   Seq len: {runtime_seq_len}")
@@ -3334,8 +3464,6 @@ def run_plan_a(args: argparse.Namespace) -> None:
                 else None
             )
             compression_ratio = 0.01   # TopK 1% (was 0.1%)
-            stable_shards = 0
-            grow_every = 3
             current_lr = args.lr
             min_lr = max(args.lr * 0.1, 1e-8)
             invalid_streak = 0
@@ -3478,7 +3606,6 @@ def run_plan_a(args: argparse.Namespace) -> None:
                                 "oom_abort_streak": oom_abort_streak,
                                 "stable_layers": int(len(assigned_layers)),
                                 "stable_seq_len": int(runtime_seq_len),
-                                "stable_batch_cap": int(max(1, batch_size_cap)),
                                 "last_update_reason": "runtime_oom_abort",
                             },
                         )
@@ -3496,38 +3623,18 @@ def run_plan_a(args: argparse.Namespace) -> None:
                                 sys.executable,
                                 [sys.executable] + with_precision_arg(sys.argv, "fp32"),
                             )
-                    stable_shards = 0
-                    if dynamic_batch_size > 1:
-                        dynamic_batch_size = max(1, dynamic_batch_size // 2)
-                        print(f"   ⚠️ Stability fallback, reducing batch size to {dynamic_batch_size}")
-                    elif oom_aborted:
-                        seq_floor = 64 if device.type in ("cuda", "mps") else 32
-                        if runtime_seq_len > seq_floor:
-                            runtime_seq_len = max(seq_floor, runtime_seq_len // 2)
-                            print(f"   ⚠️ OOM fallback, reducing seq_len to {runtime_seq_len}")
-                            save_device_profile(
-                                profile_path,
-                                profile_key,
-                                {
-                                    "stable_seq_len": int(runtime_seq_len),
-                                    "last_oom_ts": last_oom_ts,
-                                    "last_update_reason": "runtime_oom_seq_downshift",
-                                },
-                            )
-                        else:
-                            print("   ⚠️ OOM persists at min batch/seq; keeping full layer count and skipping this shard.")
+                    if oom_aborted:
+                        print(
+                            f"   ⚠️ OOM detected, but keeping your selected batch={dynamic_batch_size}. "
+                            "If this persists, restart with a smaller batch size."
+                        )
                     print("   ⚠️ No training batches completed, skipping submission.")
                     time.sleep(1)
                     continue
 
-                stable_shards += 1
                 oom_abort_streak = 0
                 invalid_streak = 0
                 trained_batch_size = int(dynamic_batch_size)
-                if dynamic_batch_size < batch_size_cap and stable_shards >= grow_every:
-                    dynamic_batch_size += 1
-                    stable_shards = 0
-                    print(f"   📈 Stable training, increasing batch size to {dynamic_batch_size}")
 
                 shards_trained += 1
                 tasks_processed += 1
@@ -3568,10 +3675,6 @@ def run_plan_a(args: argparse.Namespace) -> None:
                             sys.executable,
                             [sys.executable] + with_precision_arg(sys.argv, "fp32"),
                         )
-                    stable_shards = 0
-                    if dynamic_batch_size > 1:
-                        dynamic_batch_size = max(1, dynamic_batch_size // 2)
-                        print(f"   ⚠️ Gradient NaN/Inf fallback, reducing batch size to {dynamic_batch_size}")
                     print(f"   ⚠️ NaN/Inf detected in gradient: {bad_param}")
                     print("   ⏭️  Skipping submission, requesting next task...")
                     time.sleep(1)
@@ -3622,7 +3725,6 @@ def run_plan_a(args: argparse.Namespace) -> None:
                         {
                             "stable_layers": int(len(assigned_layers)),
                             "stable_seq_len": int(runtime_seq_len),
-                            "stable_batch_cap": int(max(1, batch_size_cap)),
                             "precision": precision_mode,
                             "last_success_ts": time.time(),
                             "last_update_reason": "accepted_gradient",
@@ -3651,7 +3753,6 @@ def run_plan_a(args: argparse.Namespace) -> None:
                                         "memory_cap_gb": float(new_mem_cap),
                                         "stable_layers": int(next_layers),
                                         "stable_seq_len": int(runtime_seq_len),
-                                        "stable_batch_cap": int(max(1, batch_size_cap)),
                                         "last_upgrade_ts": float(last_upgrade_ts),
                                         "last_update_reason": "stability_probe_upgrade",
                                     },
@@ -3732,8 +3833,28 @@ def run_plan_a(args: argparse.Namespace) -> None:
 
 
 def main():
+    configure_timestamp_logging()
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.batch_size is None:
+        startup_capabilities = get_hardware_info(args.device)
+        detected_gpu = str(
+            startup_capabilities.get("gpu_model")
+            or startup_capabilities.get("device_name")
+            or startup_capabilities.get("device_type")
+            or "unknown"
+        )
+        detected_mem_gb = float(
+            startup_capabilities.get("memory_gb")
+            or startup_capabilities.get("gpu_vram_gb")
+            or startup_capabilities.get("system_memory_gb")
+            or 0.0
+        )
+        args.batch_size = resolve_batch_size(
+            args.batch_size,
+            detected_gpu,
+            detected_mem_gb,
+        )
     if args.mode == "plan_a":
         print("⚠️  WARNING: Plan A is deprecated.")
         print("⚠️  Plan B is now the default mode.")
