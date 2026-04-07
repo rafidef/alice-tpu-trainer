@@ -213,8 +213,8 @@ def _select_batch_size(
         (1, 12, "12-16 GB", "RTX 3060, RTX 4070"),
         (4, 20, "20-24 GB", "RTX 3090, RTX 4090 24GB"),
         (8, 32, "32-40 GB", "RTX 4090 48GB, A6000, M3 Max"),
-        (16, 48, "48-64 GB", "A6000 48GB, M2 Ultra"),
-        (32, 80, "80+ GB", "A100, H100"),
+        (16, 48, "48-64 GB", "A6000 48GB, M2 Ultra, TPU v5e (4 cores)"),
+        (32, 80, "80+ GB", "A100, H100, TPU v5p, TPU pod"),
     ]
     recommended = 1
     for batch_size, min_mem_gb, _, _ in options:
