@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile miner/tpu_adapter.py)",
+      "Bash(python -m py_compile miner/tpu_launch.py)",
+      "Bash(python -m py_compile miner/alice_miner.py)",
+      "Bash(python -m py_compile miner/plan_b.py)"
+    ]
+  }
+}
