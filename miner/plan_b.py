@@ -402,7 +402,11 @@ class LocalTrainer:
                     grad = _param.grad
                     if grad is None:
                         return
-                    # On TPU pods, average gradients across cores before applying
+                    # Average gradients across local TPU cores before applying.
+                    # This keeps all cores on the same VM in sync so they produce
+                    # the same delta at epoch end.
+                    # xm.all_reduce() within an xmp.spawn() group already scopes
+                    # to the local VM's cores — no explicit group needed.
                     if _tpu_ws > 1 and _param.device.type == "xla" and TPU_ADAPTER_AVAILABLE:
                         import torch_xla.core.xla_model as xm
                         grad = xm.all_reduce(xm.REDUCE_SUM, grad) / _tpu_ws
@@ -489,9 +493,9 @@ class LocalTrainer:
 
             avg_loss = total_loss / num_batches
 
-            # On TPU pods, average the loss across all cores for consistent reporting
+            # Average the loss across local TPU cores for consistent reporting
             if self.tpu_world_size > 1 and self.device.type == "xla" and TPU_ADAPTER_AVAILABLE:
-                avg_loss = tpu_reduce_scalar(avg_loss)
+                avg_loss = tpu_reduce_scalar(avg_loss, world_size=self.tpu_world_size)
 
             _plan_b_log(
                 f"Local shard training complete: batches={num_batches}, avg_loss={avg_loss:.4f}, batch_size={current_batch_size}"
@@ -1257,24 +1261,45 @@ def _run_plan_b_worker(index: int, args: Any) -> None:
     """
     TPU multi-core worker entry point.
     Called by spawn_on_all_cores() — `index` is the local core ordinal.
-    Each core runs the full Plan B loop independently with its own data shard slice.
+
+    All local cores on this VM participate in data-parallel training:
+    each core gets a different slice of the shard, gradients are all-reduced
+    across the LOCAL cores, and a single delta is submitted per VM.
+
+    Multi-VM pods: each VM runs independently as its own miner. The Alice
+    protocol server aggregates deltas from all VMs. No cross-VM gradient
+    sync is needed — this keeps things simple and each VM earns rewards
+    independently.
     """
     import torch_xla.core.xla_model as xm
 
     # Each core gets its own XLA device
     device = xm.xla_device()
-    ordinal = xm.get_ordinal()
-    world_size = xm.xrt_world_size()
+    local_ordinal = xm.get_local_ordinal()
 
-    # Only master process handles registration and API communication
-    is_master = (ordinal == 0)
+    # Only use LOCAL core count for within-VM data parallelism.
+    # Each VM acts as an independent miner — no cross-VM sync.
+    try:
+        import torch_xla.runtime as xr
+        local_core_count = xr.local_device_count()
+    except (ImportError, AttributeError):
+        local_core_count = int(os.environ.get("TPU_NUM_DEVICES", 4))
 
-    if is_master:
-        _plan_b_log(f"TPU pod training: world_size={world_size}, this worker ordinal={ordinal}")
+    if local_ordinal == 0:
+        global_cores = xm.xrt_world_size()
+        num_vms = max(1, global_cores // max(1, local_core_count))
+        _plan_b_log(
+            f"TPU training: {local_core_count} local cores, "
+            f"{global_cores} global cores, {num_vms} VMs. "
+            f"Each VM mines independently."
+        )
 
-    # Run the core plan_b loop — all cores participate in training,
-    # but only master does registration/API calls
-    _run_plan_b_core(args, device=device, tpu_ordinal=ordinal, tpu_world_size=world_size)
+    _run_plan_b_core(
+        args,
+        device=device,
+        tpu_ordinal=local_ordinal,
+        tpu_world_size=local_core_count,
+    )
 
 
 def run_plan_b(args: Any) -> None:
@@ -1283,7 +1308,8 @@ def run_plan_b(args: Any) -> None:
     capabilities = miner_lib.get_hardware_info(getattr(args, "device", None))
     device_type = str(capabilities.get("device_type", "cpu")).lower()
 
-    # For TPU with multiple cores, use xmp.spawn to fork across all cores
+    # For TPU with multiple cores, use xmp.spawn to fork across all local cores.
+    # Each VM acts as an independent miner — no cross-VM coordination needed.
     if device_type in ("tpu", "xla") and TPU_ADAPTER_AVAILABLE and is_xla_available():
         local_cores = xla_local_device_count()
         _plan_b_log(f"Detected TPU with {local_cores} local cores, launching multi-core training")
@@ -1459,19 +1485,19 @@ def _run_plan_b_core(
 
                 if completed_shards == 0:
                     _plan_b_log("Zero shards trained this epoch, skipping delta submission")
-                    if is_tpu and TPU_ADAPTER_AVAILABLE:
+                    if is_tpu and TPU_ADAPTER_AVAILABLE and tpu_world_size > 1:
                         tpu_barrier()
                     wait_for_next_epoch(trainer)
                     continue
 
-                # On TPU pods, sync all cores before delta computation
+                # On TPU, sync local cores before delta computation.
+                # All local cores have identical weights due to gradient all-reduce.
                 if is_tpu and TPU_ADAPTER_AVAILABLE and tpu_world_size > 1:
                     tpu_barrier()
 
-                # On TPU pods, only the master core computes and submits the delta.
-                # All cores have identical weights due to gradient all-reduce.
+                # Only the local master core (ordinal 0) computes and submits
+                # the delta. Other cores wait.
                 if is_tpu and not is_master:
-                    # Non-master cores wait for master to finish submission
                     tpu_barrier()
                     wait_for_next_epoch(trainer)
                     continue

@@ -417,8 +417,12 @@ def aggregate_gradients(model: torch.nn.Module) -> None:
             grad /= world_size
 
 
-def reduce_scalar(value: float) -> float:
-    """Reduce a scalar value (e.g. loss) across all TPU cores, returning the mean."""
+def reduce_scalar(value: float, world_size: Optional[int] = None) -> float:
+    """
+    Reduce a scalar value (e.g. loss) across TPU cores, returning the mean.
+    Within xmp.spawn(), this automatically scopes to local VM cores.
+    Pass world_size to divide by a specific count (e.g. local core count).
+    """
     _require_xla()
     import torch_xla.core.xla_model as xm
 
@@ -426,7 +430,8 @@ def reduce_scalar(value: float) -> float:
     tensor = torch.tensor([value], dtype=torch.float32, device=device)
     reduced = xm.all_reduce(xm.REDUCE_SUM, tensor)
     mark_step()
-    return float(reduced.item()) / xm.xrt_world_size()
+    divisor = world_size if world_size is not None else xm.xrt_world_size()
+    return float(reduced.item()) / max(1, divisor)
 
 
 # ---------------------------------------------------------------------------
