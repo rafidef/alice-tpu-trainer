@@ -50,6 +50,26 @@ except ImportError as exc:
     ALICE_MODEL_AVAILABLE = False
     ALICE_MODEL_IMPORT_ERROR = str(exc)
 
+try:
+    from tpu_adapter import (
+        is_xla_available,
+        detect_tpu_device_info,
+        xla_device,
+        mark_step as tpu_mark_step,
+        empty_cache_tpu,
+        tpu_autocast,
+        xla_world_size,
+        xla_ordinal,
+        xla_is_master,
+        tpu_print,
+    )
+    TPU_ADAPTER_AVAILABLE = True
+except ImportError:
+    TPU_ADAPTER_AVAILABLE = False
+
+    def is_xla_available():
+        return False
+
 PROTOCOL_VERSION = "1.0"
 DATA_FORMAT = "tensor"
 DEVICE_PROFILE_PATH = Path.home() / ".alice" / "device_profile.json"
@@ -137,13 +157,58 @@ def save_batch_config(
     return payload
 
 
+def _tpu_auto_batch_size(capabilities: Dict[str, Any]) -> int:
+    """
+    Calculate recommended batch size for TPU based on per-core HBM.
+
+    On TPU, each core gets its own slice of the data (data parallelism),
+    so batch size should be tuned per-core, not for total HBM.
+    BF16 is ~30% more memory-efficient than FP16 for activations,
+    so TPU can handle larger per-core batches than equivalent GPU VRAM.
+
+    Returns per-core batch size. Effective global batch = per_core × num_cores.
+    """
+    hbm_per_core = float(capabilities.get("tpu_hbm_per_core_gb", 16.0))
+    local_cores = int(capabilities.get("tpu_local_cores", 4))
+    global_cores = int(capabilities.get("tpu_global_cores", local_cores))
+
+    # Per-core batch size tiers (BF16, more efficient than GPU FP16)
+    if hbm_per_core >= 80:      # v5p (95 GB HBM)
+        per_core_batch = 32
+    elif hbm_per_core >= 28:    # v4 (32 GB), v6e (32 GB)
+        per_core_batch = 8
+    elif hbm_per_core >= 14:    # v3 (16 GB), v5e (16 GB), v5litepod (16 GB)
+        per_core_batch = 4
+    elif hbm_per_core >= 6:     # v2 (8 GB)
+        per_core_batch = 2
+    else:
+        per_core_batch = 1
+
+    return per_core_batch
+
+
 def _select_batch_size(
     detected_gpu: str,
     detected_mem_gb: float,
     *,
     input_func=input,
     interactive: Optional[bool] = None,
+    capabilities: Optional[Dict[str, Any]] = None,
 ) -> int:
+    # TPU auto-detect path: compute per-core batch directly from HBM
+    if capabilities and str(capabilities.get("device_type", "")).lower() == "tpu":
+        per_core_batch = _tpu_auto_batch_size(capabilities)
+        local_cores = int(capabilities.get("tpu_local_cores", 4))
+        global_cores = int(capabilities.get("tpu_global_cores", local_cores))
+        hbm_per_core = float(capabilities.get("tpu_hbm_per_core_gb", 16.0))
+        tprint(
+            f"TPU auto batch size: {per_core_batch} per core "
+            f"({hbm_per_core:.0f} GB HBM/core, {local_cores} local cores, "
+            f"{global_cores} global cores, "
+            f"effective global batch = {per_core_batch * global_cores})"
+        )
+        return per_core_batch
+
     options = [
         (1, 12, "12-16 GB", "RTX 3060, RTX 4070"),
         (4, 20, "20-24 GB", "RTX 3090, RTX 4090 24GB"),
@@ -195,9 +260,19 @@ def resolve_batch_size(
     config_path: Path = BATCH_CONFIG_PATH,
     input_func=input,
     interactive: Optional[bool] = None,
+    capabilities: Optional[Dict[str, Any]] = None,
 ) -> int:
     if cli_batch_size is not None:
         return int(cli_batch_size)
+    # TPU: skip saved config (HBM layout differs per TPU type), auto-calculate
+    if capabilities and str(capabilities.get("device_type", "")).lower() == "tpu":
+        return _select_batch_size(
+            detected_gpu,
+            detected_mem_gb,
+            input_func=input_func,
+            interactive=interactive,
+            capabilities=capabilities,
+        )
     saved = load_batch_config(config_path)
     if saved and _batch_config_matches(saved, detected_gpu, detected_mem_gb):
         saved_batch = int(max(1, min(32, int(saved.get("batch_size", 1) or 1))))
@@ -217,6 +292,11 @@ def resolve_batch_size(
 
 def auto_detect_device() -> Tuple[str, float, str]:
     """Auto-detect best available device and memory."""
+    # TPU detection (highest priority when available)
+    if TPU_ADAPTER_AVAILABLE and is_xla_available():
+        tpu_info = detect_tpu_device_info()
+        return "tpu", float(tpu_info["memory_gb"]), str(tpu_info["device_name"])
+
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
         memory_gb = props.total_memory / (1024 ** 3)
@@ -309,8 +389,17 @@ def detect_device_info(device_override: Optional[str] = None) -> Dict[str, Any]:
     detected_device, detected_memory_gb, detected_name = auto_detect_device()
     device_type = (device_override or detected_device).lower()
 
-    if device_type not in {"cuda", "mps", "cpu"}:
+    if device_type not in {"cuda", "mps", "cpu", "tpu", "xla"}:
         device_type = detected_device
+
+    # Normalize "tpu" to "tpu" (internally we use "tpu" as device_type,
+    # but torch.device will use "xla")
+    if device_type in ("tpu", "xla"):
+        if TPU_ADAPTER_AVAILABLE and is_xla_available():
+            return detect_tpu_device_info()
+        else:
+            print("[WARNING] TPU requested but torch_xla not available, falling back to CPU")
+            device_type = "cpu"
 
     if device_type == "cuda" and not torch.cuda.is_available():
         device_type = "cpu"
@@ -384,6 +473,12 @@ def detect_device_info(device_override: Optional[str] = None) -> Dict[str, Any]:
 
 def format_device_log_line(info: Dict[str, Any]) -> str:
     device_type = str(info.get("device_type", "cpu")).lower()
+    if device_type == "tpu":
+        tpu_type = info.get("tpu_type", "unknown")
+        local_cores = info.get("tpu_local_cores", "?")
+        global_cores = info.get("tpu_global_cores", "?")
+        hbm = float(info.get("memory_gb", 0.0))
+        return f"[Device] TPU {tpu_type}, {local_cores} local / {global_cores} global cores, {hbm:.1f}GB HBM"
     if device_type == "cuda":
         return f"[Device] {info.get('gpu_model', 'CUDA GPU')}, {float(info.get('gpu_vram_gb', 0.0)):.1f}GB VRAM, CUDA"
     if device_type == "mps":
@@ -396,7 +491,11 @@ def calculate_layers(memory_gb: float, device_type: str) -> int:
     if device_type == "cpu":
         return 4
 
-    if device_type == "mps":
+    if device_type == "tpu":
+        # TPU HBM is very efficient; use similar ratio to CUDA
+        per_layer_gb = 0.80
+        fixed_overhead = 1.0
+    elif device_type == "mps":
         per_layer_gb = 1.0
         fixed_overhead = 2.0
     else:
@@ -425,11 +524,14 @@ def select_precision(
     - CPU: FP32
     """
     req = (requested or "auto").lower()
-    if req in ("fp16", "fp32"):
+    if req in ("fp16", "fp32", "bf16"):
         return req
 
     if device_type == "cpu":
         return "fp32"
+    if device_type == "tpu":
+        # TPU natively supports bfloat16 — always use it
+        return "bf16"
     if device_type == "cuda":
         if memory_gb >= 40.0 and assigned_layers <= 12:
             return "fp32"
@@ -461,7 +563,13 @@ def get_hardware_info(device_override: Optional[str] = None) -> Dict[str, Any]:
     """Detect hardware capabilities with optional device override."""
     detected_device, _, _ = auto_detect_device()
     selected = (device_override or detected_device).lower()
-    if selected == "cuda" and not torch.cuda.is_available():
+    if selected in ("tpu", "xla"):
+        if TPU_ADAPTER_AVAILABLE and is_xla_available():
+            return detect_device_info("tpu")
+        else:
+            print("⚠️ --device tpu requested but torch_xla is unavailable, falling back to CPU")
+            selected = "cpu"
+    elif selected == "cuda" and not torch.cuda.is_available():
         print("⚠️ --device cuda requested but CUDA is unavailable, falling back to CPU")
     elif selected == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         print("⚠️ --device mps requested but MPS is unavailable, falling back to CPU")
@@ -488,7 +596,8 @@ def calculate_batch_size(
         return 1, available_gb, 0.0
 
     batch_size = max(1, int(available_gb / per_sample_gb))
-    batch_size = min(batch_size, 16)
+    max_batch = 32 if device_type == "tpu" else 16
+    batch_size = min(batch_size, max_batch)
     return batch_size, available_gb, per_sample_gb
 
 
@@ -498,6 +607,9 @@ def conservative_start_batch(device_type: str, batch_cap: int) -> int:
         return 1
     if device_type == "mps":
         return max(1, min(batch_cap, 2))
+    if device_type == "tpu":
+        # TPU HBM is generous; start with higher batch
+        return max(1, min(batch_cap, 8))
     # CUDA: empirically stable default on 24GB cards.
     return max(1, min(batch_cap, 4))
 
@@ -506,7 +618,10 @@ def memory_required_for_layers(target_layers: int, device_type: str, fallback_me
     """Estimate memory cap needed so PS assigns at most target_layers."""
     if device_type == "cpu":
         return fallback_memory
-    if device_type == "mps":
+    if device_type == "tpu":
+        per_layer_gb = 0.80
+        fixed_overhead = 1.0
+    elif device_type == "mps":
         per_layer_gb = 1.0
         fixed_overhead = 2.0
     else:
@@ -1307,6 +1422,8 @@ def register_compression_hooks(
                 _param.grad = None
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                elif TPU_ADAPTER_AVAILABLE and is_xla_available():
+                    empty_cache_tpu()
                 return
 
             work_grad = grad.detach()
@@ -1339,6 +1456,8 @@ def register_compression_hooks(
             _param.grad = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            elif TPU_ADAPTER_AVAILABLE and is_xla_available():
+                empty_cache_tpu()
 
         hooks.append(param.register_post_accumulate_grad_hook(_hook))
 
@@ -1417,6 +1536,8 @@ def compress_gradients_after_backward(
         torch.cuda.empty_cache()
     elif device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
         torch.mps.empty_cache()
+    elif device.type == "xla" and TPU_ADAPTER_AVAILABLE:
+        empty_cache_tpu()
 
     return raw_bytes, bad_param
 
@@ -2744,9 +2865,12 @@ def train_shard(
         use_amp = (
             (device.type == "mps" and precision_mode == "fp16")
             or (device.type == "cuda" and precision_mode == "fp16")
+            or (device.type == "xla" and precision_mode in ("bf16", "fp16"))
         )
         try:
-            if use_amp:
+            if use_amp and device.type == "xla":
+                autocast_ctx = torch.autocast(device_type="xla", dtype=torch.bfloat16)
+            elif use_amp:
                 autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
             else:
                 autocast_ctx = contextlib.nullcontext()
@@ -2819,9 +2943,11 @@ def train_shard(
             model.zero_grad(set_to_none=True)
             continue
         except RuntimeError as exc:
-            if "out of memory" in str(exc).lower():
+            if "out of memory" in str(exc).lower() or "HBM" in str(exc):
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
+                elif device.type == "xla" and TPU_ADAPTER_AVAILABLE:
+                    empty_cache_tpu()
                 oom_retries_at_bs1 += 1
                 print(
                     f"⚠️ OOM detected, but keeping your selected batch={current_batch_size}. "
@@ -2836,7 +2962,11 @@ def train_shard(
 
         oom_retries_at_bs1 = 0
         start_idx += len(batch_inputs) * seq_len
-        
+
+        # Flush XLA graph after each batch to prevent OOM from graph accumulation
+        if device.type == "xla" and TPU_ADAPTER_AVAILABLE:
+            tpu_mark_step()
+
         # Print progress
         if num_batches % 5 == 0:
             avg_loss = total_loss / num_batches
@@ -3015,7 +3145,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.005,
         help="Plan B TopK delta compression ratio",
     )
-    parser.add_argument("--device", default=None, help="Training device override: cuda|mps|cpu")
+    parser.add_argument("--device", default=None, help="Training device override: cuda|mps|cpu|tpu")
     parser.add_argument(
         "--reward-address",
         default=None,
@@ -3025,8 +3155,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--precision",
         default="auto",
-        choices=["auto", "fp16", "fp32"],
-        help="Precision mode selection",
+        choices=["auto", "fp16", "fp32", "bf16"],
+        help="Precision mode selection (bf16 recommended for TPU)",
     )
     parser.add_argument(
         "--report-dir",
@@ -3332,21 +3462,31 @@ def run_plan_a(args: argparse.Namespace) -> None:
             # The meta->to_empty path can leave non-parameter buffers uninitialized
             # when loading with strict=False, which leads to NaN during forward pass.
             n_layers = 32  # Total layers in full model (partial model has fewer)
-            device = torch.device(capabilities["device_type"])
+            _dev_type = capabilities["device_type"]
+            if _dev_type in ("tpu", "xla") and TPU_ADAPTER_AVAILABLE and is_xla_available():
+                device = xla_device()
+            else:
+                device = torch.device(_dev_type)
             if device.type == "cuda":
                 total_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+            elif device.type == "xla":
+                total_memory_gb = float(capabilities.get("memory_gb", 64.0))
             elif device.type == "mps":
                 total_memory_gb = float(capabilities.get("memory_gb", 16.0))
             else:
                 total_memory_gb = float(capabilities.get("system_memory_gb", 0.0))
+            # For precision selection, pass "tpu" when on XLA so we get bf16
+            _precision_dev_type = "tpu" if device.type == "xla" else device.type
             precision_mode = select_precision(
-                device_type=device.type,
+                device_type=_precision_dev_type,
                 memory_gb=total_memory_gb,
                 assigned_layers=len(assigned_layers),
                 requested=args.precision,
             )
             model = AliceForCausalLM(alice_config)
-            if precision_mode == "fp16":
+            if precision_mode == "bf16":
+                model = model.to(torch.bfloat16)
+            elif precision_mode == "fp16":
                 model = model.half()
             else:
                 model = model.float()
@@ -3392,7 +3532,12 @@ def run_plan_a(args: argparse.Namespace) -> None:
 
             # Move model to target precision/device.
             print(f"🎯 Target device: {device}")
-            if device.type == "cuda":
+            if device.type == "xla":
+                print(f"🚀 Moving model to TPU ({device})...")
+                model = model.to(device)
+                if TPU_ADAPTER_AVAILABLE:
+                    tpu_mark_step()
+            elif device.type == "cuda":
                 print(f"🚀 Moving model to {device}...")
                 try:
                     model = model.to(device)
@@ -3463,7 +3608,9 @@ def run_plan_a(args: argparse.Namespace) -> None:
             try:
                 test_seq = max(8, min(runtime_seq_len, 32))
                 test_ids = torch.randint(0, alice_config.vocab_size, (1, test_seq), dtype=torch.long, device=device)
-                if device.type in ("cuda", "mps") and precision_mode == "fp16":
+                if device.type == "xla" and precision_mode in ("bf16", "fp16"):
+                    ctx = torch.autocast(device_type="xla", dtype=torch.bfloat16)
+                elif device.type in ("cuda", "mps") and precision_mode == "fp16":
                     ctx = torch.autocast(device_type=device.type, dtype=torch.float16)
                 else:
                     ctx = contextlib.nullcontext()
@@ -3502,6 +3649,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
             print("   ✅ Weight check complete")
 
             # Initialize AMP scaler and compression settings
+            # GradScaler is only for CUDA — TPU uses bfloat16 natively without scaling
             scaler = (
                 torch.cuda.amp.GradScaler(enabled=(precision_mode == "fp16"), init_scale=65536)
                 if device.type == "cuda"
@@ -3898,6 +4046,7 @@ def main():
             args.batch_size,
             detected_gpu,
             detected_mem_gb,
+            capabilities=startup_capabilities,
         )
     if args.mode == "plan_a":
         print("⚠️  WARNING: Plan A is deprecated.")

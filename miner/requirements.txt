@@ -6,3 +6,7 @@ substrate-interface>=1.7.0
 mnemonic
 cryptography
 
+# TPU support (optional — only needed when running on Google Cloud TPU)
+# Install with: pip install torch_xla
+# torch_xla
+

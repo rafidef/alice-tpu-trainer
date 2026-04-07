@@ -17,6 +17,33 @@ import torch
 
 import alice_miner as miner_lib
 
+try:
+    from tpu_adapter import (
+        is_xla_available,
+        xla_device,
+        xla_world_size,
+        xla_ordinal,
+        xla_local_ordinal,
+        xla_is_master,
+        xla_local_device_count,
+        mark_step as tpu_mark_step,
+        empty_cache_tpu,
+        aggregate_gradients as tpu_aggregate_gradients,
+        reduce_scalar as tpu_reduce_scalar,
+        broadcast_master_param,
+        init_tpu_distributed,
+        barrier as tpu_barrier,
+        spawn_on_all_cores,
+        get_tpu_batch_size_multiplier,
+        tpu_print,
+    )
+    TPU_ADAPTER_AVAILABLE = True
+except ImportError:
+    TPU_ADAPTER_AVAILABLE = False
+
+    def is_xla_available():
+        return False
+
 miner_lib.configure_timestamp_logging()
 
 
@@ -131,6 +158,8 @@ class LocalTrainer:
         auth: miner_lib.AtomicTokenHolder,
         args: Any,
         miner_instance_id: Optional[str] = None,
+        tpu_ordinal: int = 0,
+        tpu_world_size: int = 1,
     ) -> None:
         self.model = model
         self.device = device
@@ -140,6 +169,8 @@ class LocalTrainer:
         self.miner_instance_id = str(miner_instance_id or miner_address)
         self.auth = auth
         self.args = args
+        self.tpu_ordinal = tpu_ordinal
+        self.tpu_world_size = tpu_world_size
         self.snapshot_dir = SNAPSHOT_DIR
         self.delta_outbox_dir = DELTA_OUTBOX_DIR
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -299,10 +330,16 @@ class LocalTrainer:
         elif self.device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
             with contextlib.suppress(Exception):
                 torch.mps.empty_cache()
+        elif self.device.type == "xla" and TPU_ADAPTER_AVAILABLE:
+            empty_cache_tpu()
 
     def _is_oom_error(self, exc: BaseException) -> bool:
         message = str(exc).lower()
-        return isinstance(exc, torch.cuda.OutOfMemoryError) or "out of memory" in message
+        return (
+            isinstance(exc, torch.cuda.OutOfMemoryError)
+            or "out of memory" in message
+            or "hbm" in message  # TPU HBM OOM
+        )
 
     def save_global_snapshot(self) -> None:
         if self.model is None:
@@ -323,6 +360,15 @@ class LocalTrainer:
         if self.model is None:
             raise RuntimeError("Plan B model is not initialized")
         tokens = _extract_tokens(shard_data)
+
+        # TPU data parallelism: each core trains on a different slice of the shard
+        if self.tpu_world_size > 1 and self.device.type == "xla":
+            total_tokens = tokens.numel()
+            per_core = total_tokens // self.tpu_world_size
+            start = self.tpu_ordinal * per_core
+            end = start + per_core if self.tpu_ordinal < self.tpu_world_size - 1 else total_tokens
+            tokens = tokens[start:end]
+
         seq_len = int(getattr(self.args, "seq_len", 128) or 128)
         max_batches = int(getattr(self.args, "max_batches", 10) or 10)
         current_batch_size = max(1, int(self.effective_batch_size or self._target_batch_size() or 2))
@@ -351,10 +397,15 @@ class LocalTrainer:
                     *,
                     _param: torch.Tensor = param,
                     _lr: float = local_lr,
+                    _tpu_ws: int = self.tpu_world_size,
                 ) -> None:
                     grad = _param.grad
                     if grad is None:
                         return
+                    # On TPU pods, average gradients across cores before applying
+                    if _tpu_ws > 1 and _param.device.type == "xla" and TPU_ADAPTER_AVAILABLE:
+                        import torch_xla.core.xla_model as xm
+                        grad = xm.all_reduce(xm.REDUCE_SUM, grad) / _tpu_ws
                     _param.data = (_param.data.float() - _lr * grad.float()).to(_param.dtype)
                     _param.grad = None
 
@@ -377,9 +428,15 @@ class LocalTrainer:
                     try:
                         input_ids = torch.stack(batch_inputs).to(self.device)
                         labels = torch.stack(batch_labels).to(self.device)
-                        use_amp = self.device.type in ("cuda", "mps") and str(getattr(self.args, "precision", "auto")) != "fp32"
-                        autocast_dtype = torch.float16 if self.device.type in ("cuda", "mps") else torch.float32
-                        with (torch.autocast(device_type=self.device.type, dtype=autocast_dtype) if use_amp else contextlib.nullcontext()):
+                        precision_str = str(getattr(self.args, "precision", "auto"))
+                        use_amp = self.device.type in ("cuda", "mps", "xla") and precision_str not in ("fp32",)
+                        if self.device.type == "xla":
+                            autocast_dtype = torch.bfloat16
+                            autocast_device_type = "xla"
+                        else:
+                            autocast_dtype = torch.float16
+                            autocast_device_type = self.device.type
+                        with (torch.autocast(device_type=autocast_device_type, dtype=autocast_dtype) if use_amp else contextlib.nullcontext()):
                             _, loss = self.model(input_ids, labels)
 
                         if loss is None or not torch.isfinite(loss):
@@ -394,6 +451,10 @@ class LocalTrainer:
                         num_batches += 1
                         start_idx += len(batch_inputs) * seq_len
                         del input_ids, labels, loss
+
+                        # Flush XLA graph after each batch
+                        if self.device.type == "xla" and TPU_ADAPTER_AVAILABLE:
+                            tpu_mark_step()
                     except Exception as exc:
                         if not self._is_oom_error(exc):
                             raise
@@ -427,6 +488,11 @@ class LocalTrainer:
             self.stable_shards_at_current_batch = 0
 
             avg_loss = total_loss / num_batches
+
+            # On TPU pods, average the loss across all cores for consistent reporting
+            if self.tpu_world_size > 1 and self.device.type == "xla" and TPU_ADAPTER_AVAILABLE:
+                avg_loss = tpu_reduce_scalar(avg_loss)
+
             _plan_b_log(
                 f"Local shard training complete: batches={num_batches}, avg_loss={avg_loss:.4f}, batch_size={current_batch_size}"
             )
@@ -832,6 +898,9 @@ class LocalTrainer:
                 torch.cuda.empty_cache()
             with contextlib.suppress(Exception):
                 torch.cuda.ipc_collect()
+        elif self.device.type == "xla" and TPU_ADAPTER_AVAILABLE:
+            with contextlib.suppress(Exception):
+                empty_cache_tpu()
         _plan_b_log(f"Released in-memory full model v{old_version}")
 
     def _cleanup_model_cache(self, keep_versions: int = 1) -> None:
@@ -899,11 +968,15 @@ class LocalTrainer:
             alice_config.num_layers = max(layer_indices) + 1
 
         precision_mode = str(getattr(self.args, "precision", "auto"))
-        build_dtype = (
-            torch.float16
-            if self.device.type in ("cuda", "mps") and precision_mode != "fp32"
-            else torch.float32
-        )
+        if self.device.type == "xla":
+            # TPU uses bfloat16 natively
+            build_dtype = torch.bfloat16 if precision_mode != "fp32" else torch.float32
+        else:
+            build_dtype = (
+                torch.float16
+                if self.device.type in ("cuda", "mps") and precision_mode != "fp32"
+                else torch.float32
+            )
         prev_dtype = torch.get_default_dtype()
         try:
             torch.set_default_dtype(build_dtype)
@@ -913,7 +986,9 @@ class LocalTrainer:
         model.load_state_dict(state_dict, strict=False)
         del state_dict
         gc.collect()
-        if self.device.type in ("cuda", "mps") and precision_mode != "fp32":
+        if self.device.type == "xla" and precision_mode != "fp32":
+            model = model.to(torch.bfloat16)
+        elif self.device.type in ("cuda", "mps") and precision_mode != "fp32":
             model = model.half()
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
@@ -922,6 +997,8 @@ class LocalTrainer:
                 param.data = param.data.to(self.device)
             for buf in model.buffers():
                 buf.data = buf.data.to(self.device)
+        if self.device.type == "xla" and TPU_ADAPTER_AVAILABLE:
+            tpu_mark_step()
         return model
 
     def download_full_model(
@@ -1165,13 +1242,85 @@ def wait_for_next_epoch(trainer: LocalTrainer, poll_interval_s: int = 15) -> Non
             waited_s = 0
 
 
+def _resolve_torch_device(capabilities: Dict[str, Any]) -> torch.device:
+    """Resolve the torch.device from capabilities dict. Maps 'tpu' -> XLA device."""
+    device_type = str(capabilities.get("device_type", "cpu")).lower()
+    if device_type in ("tpu", "xla"):
+        if TPU_ADAPTER_AVAILABLE and is_xla_available():
+            return xla_device()
+        _plan_b_log("TPU requested but torch_xla not available, falling back to CPU")
+        return torch.device("cpu")
+    return torch.device(device_type)
+
+
+def _run_plan_b_worker(index: int, args: Any) -> None:
+    """
+    TPU multi-core worker entry point.
+    Called by spawn_on_all_cores() — `index` is the local core ordinal.
+    Each core runs the full Plan B loop independently with its own data shard slice.
+    """
+    import torch_xla.core.xla_model as xm
+
+    # Each core gets its own XLA device
+    device = xm.xla_device()
+    ordinal = xm.get_ordinal()
+    world_size = xm.xrt_world_size()
+
+    # Only master process handles registration and API communication
+    is_master = (ordinal == 0)
+
+    if is_master:
+        _plan_b_log(f"TPU pod training: world_size={world_size}, this worker ordinal={ordinal}")
+
+    # Run the core plan_b loop — all cores participate in training,
+    # but only master does registration/API calls
+    _run_plan_b_core(args, device=device, tpu_ordinal=ordinal, tpu_world_size=world_size)
+
+
 def run_plan_b(args: Any) -> None:
+    control_plane_url = _normalize_url(args.ps_url)
+    args.model_dir = Path(getattr(args, "model_dir", miner_lib.DEFAULT_MODEL_DIR))
+    capabilities = miner_lib.get_hardware_info(getattr(args, "device", None))
+    device_type = str(capabilities.get("device_type", "cpu")).lower()
+
+    # For TPU with multiple cores, use xmp.spawn to fork across all cores
+    if device_type in ("tpu", "xla") and TPU_ADAPTER_AVAILABLE and is_xla_available():
+        local_cores = xla_local_device_count()
+        _plan_b_log(f"Detected TPU with {local_cores} local cores, launching multi-core training")
+        spawn_on_all_cores(_run_plan_b_worker, args=(args,), nprocs=local_cores)
+        return
+
+    # Non-TPU path: run directly
+    _run_plan_b_core(args)
+
+
+def _run_plan_b_core(
+    args: Any,
+    device: Optional[torch.device] = None,
+    tpu_ordinal: int = 0,
+    tpu_world_size: int = 1,
+) -> None:
+    """
+    Core Plan B loop. Runs on a single device (GPU/CPU/single TPU core).
+    For TPU pods, this is called once per core via _run_plan_b_worker.
+    """
     control_plane_url = _normalize_url(args.ps_url)
     args.model_dir = Path(getattr(args, "model_dir", miner_lib.DEFAULT_MODEL_DIR))
     capabilities = miner_lib.get_hardware_info(getattr(args, "device", None))
     wallet_address = str(args.address or "").strip()
     miner_instance_id = str(args.instance_id).strip() if args.instance_id else None
-    lock_fp = miner_lib.acquire_single_instance_lock(miner_instance_id)
+
+    is_tpu = (device is not None and device.type == "xla")
+    is_master = (tpu_ordinal == 0)
+
+    # For TPU non-master cores, append ordinal to instance_id to avoid conflicts
+    if is_tpu and not is_master:
+        if miner_instance_id:
+            miner_instance_id = f"{miner_instance_id}_tpu{tpu_ordinal}"
+        else:
+            miner_instance_id = f"tpu_core_{tpu_ordinal}"
+
+    lock_fp = miner_lib.acquire_single_instance_lock(miner_instance_id) if is_master else None
     heartbeat_stop: Optional[Any] = None
     heartbeat_re_register: Optional[Any] = None
     runtime_session: Optional[miner_lib.RuntimeSession] = None
@@ -1182,7 +1331,8 @@ def run_plan_b(args: Any) -> None:
         try:
             route_info = miner_lib.resolve_runtime_route(control_plane_url)
             data_plane_url = str(route_info.get("base_url") or control_plane_url)
-            miner_lib.log_runtime_route(route_info, control_plane_url)
+            if is_master:
+                miner_lib.log_runtime_route(route_info, control_plane_url)
             register_response = miner_lib.register_miner_with_retry(
                 data_plane_url,
                 wallet_address,
@@ -1217,7 +1367,8 @@ def run_plan_b(args: Any) -> None:
                     instance_id=miner_instance_id,
                 )
 
-            device = torch.device(capabilities["device_type"])
+            if device is None:
+                device = _resolve_torch_device(capabilities)
             trainer = LocalTrainer(
                 model=None,
                 device=device,
@@ -1227,6 +1378,8 @@ def run_plan_b(args: Any) -> None:
                 auth=runtime_session.auth,
                 args=args,
                 miner_instance_id=miner_instance_id,
+                tpu_ordinal=tpu_ordinal,
+                tpu_world_size=tpu_world_size,
             )
             if not _flush_pending_delta(trainer, "Found pending delta spool at startup"):
                 _plan_b_log("Pending delta upload failed at startup; re-registering before training")
@@ -1306,6 +1459,20 @@ def run_plan_b(args: Any) -> None:
 
                 if completed_shards == 0:
                     _plan_b_log("Zero shards trained this epoch, skipping delta submission")
+                    if is_tpu and TPU_ADAPTER_AVAILABLE:
+                        tpu_barrier()
+                    wait_for_next_epoch(trainer)
+                    continue
+
+                # On TPU pods, sync all cores before delta computation
+                if is_tpu and TPU_ADAPTER_AVAILABLE and tpu_world_size > 1:
+                    tpu_barrier()
+
+                # On TPU pods, only the master core computes and submits the delta.
+                # All cores have identical weights due to gradient all-reduce.
+                if is_tpu and not is_master:
+                    # Non-master cores wait for master to finish submission
+                    tpu_barrier()
                     wait_for_next_epoch(trainer)
                     continue
 
@@ -1366,6 +1533,9 @@ def run_plan_b(args: Any) -> None:
                             _plan_b_log("Re-register returned empty token; skipping delta retry")
                     except Exception as exc:
                         _plan_b_log(f"Re-register for delta retry failed: {exc}")
+                # Signal non-master TPU cores that submission is done
+                if is_tpu and TPU_ADAPTER_AVAILABLE and tpu_world_size > 1:
+                    tpu_barrier()
                 wait_for_next_epoch(trainer)
         except KeyboardInterrupt:
             if heartbeat_stop is not None:
