@@ -34,8 +34,9 @@ def is_xla_available() -> bool:
     try:
         import torch_xla  # noqa: F401
         import torch_xla.core.xla_model as xm  # noqa: F401
-        # Try to actually reach a TPU device
-        _ = xm.xla_device()
+        # Do not call xm.xla_device() here! It initializes the XLA runtime,
+        # which crashes xmp.spawn() later. Just check if the module imports
+        # and if we are on a TPU.
         _xla_available = True
     except Exception:
         _xla_available = False
