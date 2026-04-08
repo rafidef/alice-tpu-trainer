@@ -435,6 +435,20 @@ def spawn_on_all_cores(fn, args=(), nprocs: Optional[int] = None):
     _require_xla()
     import torch_xla.distributed.xla_multiprocessing as xmp
 
+    # Disable multi-VM discovery for PyTorch XLA PJRT in case the user didn't use the launcher.
+    # Since each VM operates entirely independently, we must prevent PyTorch XLA
+    # from trying to connect to other VMs in the pod.
+    for key in [
+        "TPU_WORKER_HOSTNAMES",
+        "MEGATRON_WORKER_HOSTNAMES",
+        "CLOUD_TPU_TASK_ID",
+        "TPU_PROCESS_ADDRESSES",
+    ]:
+        os.environ.pop(key, None)
+    os.environ["TPU_WORKER_ID"] = "0"
+    os.environ.pop("TPU_NAME", None)
+    os.environ.pop("TPU_POD_NAME", None)
+
     # Modern PJRT fix (required on v5 TPUs)
     # Explicit nprocs > 1 is no longer supported.
     # nprocs=None tells it to automatically use ALL available TPU cores.

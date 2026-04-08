@@ -59,6 +59,21 @@ def main():
     os.environ.setdefault("XLA_PERSISTENT_CACHE_PATH", xla_cache_dir)
     os.environ.setdefault("XLA_FLAGS", f"--xla_gpu_autotune_level=0")
 
+    # Disable multi-VM discovery for PyTorch XLA PJRT
+    # Since each VM operates entirely independently, we must prevent PyTorch XLA
+    # from trying to connect to other VMs in the pod.
+    for key in [
+        "TPU_WORKER_HOSTNAMES",
+        "MEGATRON_WORKER_HOSTNAMES",
+        "CLOUD_TPU_TASK_ID",
+        "TPU_PROCESS_ADDRESSES",
+    ]:
+        os.environ.pop(key, None)
+    # Reset WORKER_ID so PyTorch XLA thinks it's the master of its own single-node cluster
+    os.environ["TPU_WORKER_ID"] = "0"
+    os.environ.pop("TPU_NAME", None)
+    os.environ.pop("TPU_POD_NAME", None)
+
     # DO NOT import torch_xla.runtime or xla_model here before xmp.spawn!
     # It will initialize the XLA runtime and cause "Runtime is already initialized" error.
 
