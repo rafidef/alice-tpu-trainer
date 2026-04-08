@@ -396,7 +396,22 @@ def detect_device_info(device_override: Optional[str] = None) -> Dict[str, Any]:
     # but torch.device will use "xla")
     if device_type in ("tpu", "xla"):
         if TPU_ADAPTER_AVAILABLE and is_xla_available():
-            return detect_tpu_device_info()
+            # If we call this before xmp.spawn, we might trigger XLA runtime init.
+            # To be safe, we just return a fast approximation here, which gets overriden
+            # correctly in _run_plan_b_worker once XLA is safe to use.
+            import tpu_adapter
+            cores = tpu_adapter.xla_local_device_count_safe()
+            return {
+                "device": "tpu",
+                "device_type": "tpu",
+                "device_name": f"TPU ({cores} cores)",
+                "memory_gb": 16.0 * cores,
+                "runtime_memory_cap_gb": 16.0 * cores,
+                "system_memory_gb": 16.0 * cores,
+                "tpu_local_cores": cores,
+                "platform": platform.system().lower(),
+                "arch": platform.machine().lower(),
+            }
         else:
             print("[WARNING] TPU requested but torch_xla not available, falling back to CPU")
             device_type = "cpu"

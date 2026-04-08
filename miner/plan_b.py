@@ -26,6 +26,7 @@ try:
         xla_local_ordinal,
         xla_is_master,
         xla_local_device_count,
+    xla_local_device_count_safe,
         mark_step as tpu_mark_step,
         empty_cache_tpu,
         aggregate_gradients as tpu_aggregate_gradients,
@@ -1291,7 +1292,10 @@ def _run_plan_b_worker(index: int, args: Any) -> None:
         local_core_count = int(os.environ.get("TPU_NUM_DEVICES", 4))
 
     if local_ordinal == 0:
-        global_cores = xr.world_size()          # ← FIXED (was xm.xrt_world_size())
+        try:
+            global_cores = xr.global_device_count()
+        except AttributeError:
+            global_cores = xr.world_size()
         num_vms = max(1, global_cores // max(1, local_core_count))
         _plan_b_log(
             f"TPU training: {local_core_count} local cores, "
@@ -1315,7 +1319,7 @@ def run_plan_b(args: Any) -> None:
     # For TPU with multiple cores, use xmp.spawn to fork across all local cores.
     # Each VM acts as an independent miner — no cross-VM coordination needed.
     if device_type in ("tpu", "xla") and TPU_ADAPTER_AVAILABLE and is_xla_available():
-        local_cores = xla_local_device_count()
+        local_cores = xla_local_device_count_safe()
         _plan_b_log(f"Detected TPU with {local_cores} local cores, launching multi-core training")
         spawn_on_all_cores(_run_plan_b_worker, args=(args,), nprocs=None)
         return

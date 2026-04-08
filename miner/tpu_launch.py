@@ -59,22 +59,30 @@ def main():
     os.environ.setdefault("XLA_PERSISTENT_CACHE_PATH", xla_cache_dir)
     os.environ.setdefault("XLA_FLAGS", f"--xla_gpu_autotune_level=0")
 
-    # Import after env vars are set
-    import torch_xla.runtime as xr
-    import torch_xla.core.xla_model as xm
+    # DO NOT import torch_xla.runtime or xla_model here before xmp.spawn!
+    # It will initialize the XLA runtime and cause "Runtime is already initialized" error.
 
-    local_cores = xr.local_device_count()
-    global_cores = xr.global_device_count()
+    # We can infer configuration from env vars instead of querying XLA directly in the launcher.
+    accelerator_type = os.environ.get('TPU_ACCELERATOR_TYPE', 'auto-detected')
     worker_id = int(os.environ.get("TPU_WORKER_ID", "0"))
+
+    # Best-effort inference of cores to log
+    local_cores = int(os.environ.get("TPU_NUM_DEVICES", "4"))
+
+    # In newer TPU pods, ACCELERATOR_TYPE might look like v5litepod-32
+    global_cores = local_cores
+    if '-' in accelerator_type and accelerator_type.split('-')[1].isdigit():
+        global_cores = int(accelerator_type.split('-')[1])
+
     num_vms = max(1, global_cores // max(1, local_cores))
 
     print(f"[TPU-LAUNCH] TPU Configuration:")
-    print(f"  Accelerator type: {os.environ.get('TPU_ACCELERATOR_TYPE', 'auto-detected')}")
-    print(f"  Local cores (this VM): {local_cores}")
-    print(f"  Global cores (all VMs): {global_cores}")
-    print(f"  Number of VMs in pod: {num_vms}")
+    print(f"  Accelerator type: {accelerator_type}")
+    print(f"  Local cores (this VM): ~{local_cores} (estimated before launch)")
+    print(f"  Global cores (all VMs): ~{global_cores} (estimated before launch)")
+    print(f"  Number of VMs in pod: ~{num_vms}")
     print(f"  This VM worker ID: {worker_id}")
-    print(f"  Mode: each VM mines independently ({num_vms} independent miners)")
+    print(f"  Mode: each VM mines independently (~{num_vms} independent miners)")
 
     # Force the miner to use TPU device
     sys.argv_backup = list(sys.argv)
