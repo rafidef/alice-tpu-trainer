@@ -10,6 +10,7 @@ Requires: torch_xla  (pip install torch_xla)
 
 from __future__ import annotations
 
+import torch_xla.runtime as xr
 import contextlib
 import os
 import time
@@ -64,7 +65,7 @@ def xla_device_count() -> int:
     """Return the number of local TPU cores (devices) on this VM."""
     _require_xla()
     import torch_xla.core.xla_model as xm
-    return xm.xrt_world_size()
+    return xr.world_size()
 
 
 def xla_local_device_count() -> int:
@@ -82,21 +83,21 @@ def xla_world_size() -> int:
     """Return total number of TPU cores across all VMs in the pod."""
     _require_xla()
     import torch_xla.core.xla_model as xm
-    return xm.xrt_world_size()
+    return xm.xr_world_size()
 
 
 def xla_ordinal() -> int:
     """Return global ordinal of this process in the pod."""
     _require_xla()
     import torch_xla.core.xla_model as xm
-    return xm.get_ordinal()
+    return xr.global_ordinal()
 
 
 def xla_local_ordinal() -> int:
     """Return local ordinal of this process within its VM."""
     _require_xla()
     import torch_xla.core.xla_model as xm
-    return xm.get_local_ordinal()
+    return xr.local_ordinal()
 
 
 def xla_is_master() -> bool:
