@@ -1263,7 +1263,7 @@ def _run_plan_b_worker(index: int, args: Any) -> None:
     Called by spawn_on_all_cores() — `index` is the local core ordinal.
 
     All local cores on this VM participate in data-parallel training:
-    each core gets a different slice of the shard, gradients are all-reduced
+    each core trains on a different slice of the shard, gradients are all-reduced
     across the LOCAL cores, and a single delta is submitted per VM.
 
     Multi-VM pods: each VM runs independently as its own miner. The Alice
@@ -1275,7 +1275,10 @@ def _run_plan_b_worker(index: int, args: Any) -> None:
 
     # Each core gets its own XLA device
     device = xm.xla_device()
-    local_ordinal = xm.get_local_ordinal()
+
+    # Use the index passed by xmp.spawn (this is the local ordinal)
+    # No more deprecated xm.get_local_ordinal()
+    local_ordinal = index
 
     # Only use LOCAL core count for within-VM data parallelism.
     # Each VM acts as an independent miner — no cross-VM sync.
@@ -1286,7 +1289,7 @@ def _run_plan_b_worker(index: int, args: Any) -> None:
         local_core_count = int(os.environ.get("TPU_NUM_DEVICES", 4))
 
     if local_ordinal == 0:
-        global_cores = xm.xrt_world_size()
+        global_cores = xr.world_size()          # ← FIXED (was xm.xrt_world_size())
         num_vms = max(1, global_cores // max(1, local_core_count))
         _plan_b_log(
             f"TPU training: {local_core_count} local cores, "
@@ -1300,7 +1303,6 @@ def _run_plan_b_worker(index: int, args: Any) -> None:
         tpu_ordinal=local_ordinal,
         tpu_world_size=local_core_count,
     )
-
 
 def run_plan_b(args: Any) -> None:
     control_plane_url = _normalize_url(args.ps_url)
