@@ -374,19 +374,18 @@ def get_tpu_batch_size_multiplier() -> int:
 
 def spawn_on_all_cores(fn, args=(), nprocs: Optional[int] = None):
     """
-    Spawn a function on all local TPU cores.
-    Each process gets (index, *args) as arguments.
+    Spawn a function on all local TPU cores (one process per core).
+    Works on both old and new torch_xla/PJRT runtimes (v5e, v5litepod, etc.).
 
-    For multi-VM pods, this should be called on each VM.
-    The pod orchestrator (tpu_launch.py) handles running across VMs.
+    Each worker receives (index, *args) where index = local core ordinal (0..N-1).
     """
     _require_xla()
     import torch_xla.distributed.xla_multiprocessing as xmp
 
-    if nprocs is None:
-        nprocs = xla_local_device_count()
-
-    xmp.spawn(fn, args=args, nprocs=nprocs)
+    # 🔥 Modern PJRT fix (required on v5 TPUs)
+    # Explicit nprocs > 1 is no longer supported.
+    # nprocs=None tells it to automatically use ALL available TPU cores.
+    xmp.spawn(fn, args=args, nprocs=None)
 
 
 # ---------------------------------------------------------------------------
