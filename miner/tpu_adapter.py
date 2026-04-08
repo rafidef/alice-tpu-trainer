@@ -34,8 +34,9 @@ def is_xla_available() -> bool:
     try:
         import torch_xla  # noqa: F401
         import torch_xla.core.xla_model as xm  # noqa: F401
-        # Try to actually reach a TPU device
-        _ = xm.xla_device()
+        # Do not call xm.xla_device() here! It initializes the XLA runtime,
+        # which crashes xmp.spawn() later. Just check if the module imports
+        # and if we are on a TPU.
         _xla_available = True
     except Exception:
         _xla_available = False
@@ -69,7 +70,11 @@ def xla_device_count() -> int:
 
 
 def xla_local_device_count() -> int:
-    """Return the number of TPU cores visible to this VM."""
+    """Return the number of TPU cores visible to this VM.
+
+    Warning: Calling this before xmp.spawn will initialize the runtime!
+    If you need the count before spawn, use `xla_local_device_count_safe()`.
+    """
     _require_xla()
     try:
         import torch_xla.runtime as xr
@@ -77,6 +82,11 @@ def xla_local_device_count() -> int:
     except (ImportError, AttributeError):
         # Fallback for older torch_xla versions
         return int(os.environ.get("TPU_NUM_DEVICES", 4))
+
+
+def xla_local_device_count_safe() -> int:
+    """Return the number of TPU cores without initializing the XLA runtime."""
+    return int(os.environ.get("TPU_NUM_DEVICES", 4))
 
 
 def xla_world_size() -> int:
