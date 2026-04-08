@@ -114,13 +114,8 @@ def detect_tpu_info() -> Dict[str, Any]:
     _require_xla()
     import torch_xla.core.xla_model as xm
 
-    try:
-        import torch_xla.runtime as xr
-        local_cores = xr.local_device_count()
-        global_cores = xr.global_device_count()
-    except (ImportError, AttributeError):
-        local_cores = int(os.environ.get("TPU_NUM_DEVICES", 4))
-        global_cores = xm.xrt_world_size()
+    local_cores = xr.local_device_count()
+    global_cores = xr.global_device_count()
 
     # Determine TPU type from env or metadata
     tpu_type = os.environ.get("TPU_ACCELERATOR_TYPE", "unknown")
@@ -155,8 +150,8 @@ def detect_tpu_info() -> Dict[str, Any]:
         "hbm_per_core_gb": hbm_per_core_gb,
         "total_local_hbm_gb": total_hbm_gb,
         "total_pod_hbm_gb": hbm_per_core_gb * global_cores,
-        "ordinal": xm.get_ordinal(),
-        "local_ordinal": xm.get_local_ordinal(),
+        "ordinal": xr.global_ordinal(),
+        "local_ordinal": xr.local_ordinal(),
     }
 
 
