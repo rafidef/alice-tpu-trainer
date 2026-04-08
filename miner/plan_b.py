@@ -996,11 +996,7 @@ class LocalTrainer:
             model = model.half()
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
-        with torch.no_grad():
-            for param in model.parameters():
-                param.data = param.data.to(self.device)
-            for buf in model.buffers():
-                buf.data = buf.data.to(self.device)
+        model = model.to(self.device)
         if self.device.type == "xla" and TPU_ADAPTER_AVAILABLE:
             tpu_mark_step()
         return model
