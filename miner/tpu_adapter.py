@@ -122,15 +122,16 @@ def xla_is_master() -> bool:
 def detect_tpu_info() -> Dict[str, Any]:
     """Detect TPU hardware details. Returns a capabilities dict."""
     _require_xla()
-    import torch_xla.core.xla_model as xm
-
-    local_cores = xr.local_device_count()
-    global_cores = xr.global_device_count()
 
     # Determine TPU type from env or metadata
     tpu_type = os.environ.get("TPU_ACCELERATOR_TYPE", "unknown")
     if tpu_type == "unknown":
         tpu_type = os.environ.get("ACCELERATOR_TYPE", "unknown")
+
+    local_cores = xla_local_device_count_safe()
+    global_cores = local_cores
+    if '-' in tpu_type and tpu_type.split('-')[1].isdigit():
+        global_cores = int(tpu_type.split('-')[1])
 
     # TPU memory per core (HBM)
     tpu_memory_map = {
@@ -160,8 +161,8 @@ def detect_tpu_info() -> Dict[str, Any]:
         "hbm_per_core_gb": hbm_per_core_gb,
         "total_local_hbm_gb": total_hbm_gb,
         "total_pod_hbm_gb": hbm_per_core_gb * global_cores,
-        "ordinal": xr.global_ordinal(),
-        "local_ordinal": xr.local_ordinal(),
+        "ordinal": 0,
+        "local_ordinal": 0,
     }
 
 
