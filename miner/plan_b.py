@@ -405,11 +405,17 @@ class LocalTrainer:
                     # Average gradients across local TPU cores before applying.
                     # This keeps all cores on the same VM in sync so they produce
                     # the same delta at epoch end.
-                    # xm.all_reduce() within an xmp.spawn() group already scopes
-                    # to the local VM's cores — no explicit group needed.
                     if _tpu_ws > 1 and _param.device.type == "xla" and TPU_ADAPTER_AVAILABLE:
                         import torch_xla.core.xla_model as xm
-                        grad = xm.all_reduce(xm.REDUCE_SUM, grad) / _tpu_ws
+                        try:
+                            import torch_xla.runtime as xr
+                            local_device_count = xr.local_device_count()
+                            global_device_count = xr.global_device_count()
+                            # groups must be a list of lists representing process groups for ALL global replicas
+                            local_group = [list(range(i, i + local_device_count)) for i in range(0, global_device_count, local_device_count)]
+                            grad = xm.all_reduce(xm.REDUCE_SUM, grad, groups=local_group) / _tpu_ws
+                        except (ImportError, AttributeError):
+                            grad = xm.all_reduce(xm.REDUCE_SUM, grad) / _tpu_ws
                     _param.data = (_param.data.float() - _lr * grad.float()).to(_param.dtype)
                     _param.grad = None
 
@@ -1311,7 +1317,7 @@ def run_plan_b(args: Any) -> None:
     if device_type in ("tpu", "xla") and TPU_ADAPTER_AVAILABLE and is_xla_available():
         local_cores = xla_local_device_count()
         _plan_b_log(f"Detected TPU with {local_cores} local cores, launching multi-core training")
-        spawn_on_all_cores(_run_plan_b_worker, args=(args,), nprocs=local_cores)
+        spawn_on_all_cores(_run_plan_b_worker, args=(args,), nprocs=None)
         return
 
     # Non-TPU path: run directly

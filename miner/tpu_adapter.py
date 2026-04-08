@@ -229,10 +229,20 @@ def init_tpu_distributed() -> None:
 
 
 def barrier() -> None:
-    """Synchronize all processes in the pod."""
+    """Synchronize all local processes on this VM."""
     _require_xla()
     import torch_xla.core.xla_model as xm
-    xm.rendezvous("alice_barrier")
+    # Create a local process group for rendezvous so we don't wait for other VMs
+    try:
+        import torch_xla.runtime as xr
+        local_device_count = xr.local_device_count()
+        global_device_count = xr.global_device_count()
+        # replicas must be a list of lists representing process groups for ALL global replicas
+        local_group = [list(range(i, i + local_device_count)) for i in range(0, global_device_count, local_device_count)]
+        # Ensure we only sync local devices
+        xm.rendezvous("alice_local_barrier", payload=b'', replicas=local_group)
+    except (ImportError, AttributeError):
+        xm.rendezvous("alice_barrier")
 
 
 def mark_step() -> None:
@@ -247,28 +257,60 @@ def mark_step() -> None:
 
 
 def all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
-    """All-reduce (sum) a tensor across all TPU cores in the pod."""
+    """All-reduce (sum) a tensor across all local TPU cores."""
     _require_xla()
     import torch_xla.core.xla_model as xm
-    return xm.all_reduce(xm.REDUCE_SUM, tensor)
+
+    try:
+        import torch_xla.runtime as xr
+        local_device_count = xr.local_device_count()
+        global_device_count = xr.global_device_count()
+        # groups must be a list of lists representing process groups for ALL global replicas
+        local_group = [list(range(i, i + local_device_count)) for i in range(0, global_device_count, local_device_count)]
+        return xm.all_reduce(xm.REDUCE_SUM, tensor, groups=local_group)
+    except (ImportError, AttributeError):
+        return xm.all_reduce(xm.REDUCE_SUM, tensor)
 
 
 def all_reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
-    """All-reduce a tensor and divide by world size to get mean."""
+    """All-reduce a tensor across local cores and divide by world size to get mean."""
     _require_xla()
     import torch_xla.core.xla_model as xm
-    reduced = xm.all_reduce(xm.REDUCE_SUM, tensor)
-    return reduced / xm.xrt_world_size()
+
+    try:
+        import torch_xla.runtime as xr
+        local_device_count = xr.local_device_count()
+        global_device_count = xr.global_device_count()
+        # groups must be a list of lists representing process groups for ALL global replicas
+        local_group = [list(range(i, i + local_device_count)) for i in range(0, global_device_count, local_device_count)]
+        reduced = xm.all_reduce(xm.REDUCE_SUM, tensor, groups=local_group)
+    except (ImportError, AttributeError):
+        reduced = xm.all_reduce(xm.REDUCE_SUM, tensor)
+
+    return reduced / xla_local_device_count()
 
 
 def broadcast_master_param(model: torch.nn.Module) -> None:
-    """Broadcast model parameters from master (ordinal 0) to all workers."""
+    """Broadcast model parameters from master (ordinal 0) to all workers on the local VM."""
     _require_xla()
     import torch_xla.core.xla_model as xm
 
+    try:
+        import torch_xla.runtime as xr
+        local_device_count = xr.local_device_count()
+        global_device_count = xr.global_device_count()
+        # groups must be a list of lists representing process groups for ALL global replicas
+        local_group = [list(range(i, i + local_device_count)) for i in range(0, global_device_count, local_device_count)]
+    except (ImportError, AttributeError):
+        local_group = None
+
+    world_size = xla_local_device_count()
     for param in model.parameters():
-        xm.all_reduce(xm.REDUCE_SUM, param.data)
-        param.data /= xm.xrt_world_size()
+        if local_group is not None:
+            xm.all_reduce(xm.REDUCE_SUM, param.data, groups=local_group)
+        else:
+            xm.all_reduce(xm.REDUCE_SUM, param.data)
+        param.data /= world_size
     mark_step()
 
 
@@ -382,7 +424,7 @@ def spawn_on_all_cores(fn, args=(), nprocs: Optional[int] = None):
     _require_xla()
     import torch_xla.distributed.xla_multiprocessing as xmp
 
-    # 🔥 Modern PJRT fix (required on v5 TPUs)
+    # Modern PJRT fix (required on v5 TPUs)
     # Explicit nprocs > 1 is no longer supported.
     # nprocs=None tells it to automatically use ALL available TPU cores.
     xmp.spawn(fn, args=args, nprocs=None)
@@ -394,11 +436,20 @@ def spawn_on_all_cores(fn, args=(), nprocs: Optional[int] = None):
 
 def aggregate_gradients(model: torch.nn.Module) -> None:
     """
-    Average gradients across all TPU cores before optimizer step.
-    This implements data-parallel gradient synchronization.
+    Average gradients across all local TPU cores before optimizer step.
+    This implements data-parallel gradient synchronization within a VM.
     """
     _require_xla()
     import torch_xla.core.xla_model as xm
+
+    try:
+        import torch_xla.runtime as xr
+        local_device_count = xr.local_device_count()
+        global_device_count = xr.global_device_count()
+        # groups must be a list of lists representing process groups for ALL global replicas
+        local_group = [list(range(i, i + local_device_count)) for i in range(0, global_device_count, local_device_count)]
+    except (ImportError, AttributeError):
+        local_group = None
 
     gradients = []
     for param in model.parameters():
@@ -406,26 +457,42 @@ def aggregate_gradients(model: torch.nn.Module) -> None:
             gradients.append(param.grad)
 
     if gradients:
-        xm.all_reduce(xm.REDUCE_SUM, gradients)
-        world_size = xm.xrt_world_size()
+        if local_group is not None:
+            xm.all_reduce(xm.REDUCE_SUM, gradients, groups=local_group)
+        else:
+            xm.all_reduce(xm.REDUCE_SUM, gradients)
+
+        world_size = xla_local_device_count()
         for grad in gradients:
             grad /= world_size
 
 
 def reduce_scalar(value: float, world_size: Optional[int] = None) -> float:
     """
-    Reduce a scalar value (e.g. loss) across TPU cores, returning the mean.
-    Within xmp.spawn(), this automatically scopes to local VM cores.
-    Pass world_size to divide by a specific count (e.g. local core count).
+    Reduce a scalar value (e.g. loss) across local TPU cores, returning the mean.
     """
     _require_xla()
     import torch_xla.core.xla_model as xm
 
+    try:
+        import torch_xla.runtime as xr
+        local_device_count = xr.local_device_count()
+        global_device_count = xr.global_device_count()
+        # groups must be a list of lists representing process groups for ALL global replicas
+        local_group = [list(range(i, i + local_device_count)) for i in range(0, global_device_count, local_device_count)]
+    except (ImportError, AttributeError):
+        local_group = None
+
     device = xm.xla_device()
     tensor = torch.tensor([value], dtype=torch.float32, device=device)
-    reduced = xm.all_reduce(xm.REDUCE_SUM, tensor)
+
+    if local_group is not None:
+        reduced = xm.all_reduce(xm.REDUCE_SUM, tensor, groups=local_group)
+    else:
+        reduced = xm.all_reduce(xm.REDUCE_SUM, tensor)
+
     mark_step()
-    divisor = world_size if world_size is not None else xm.xrt_world_size()
+    divisor = world_size if world_size is not None else xla_local_device_count()
     return float(reduced.item()) / max(1, divisor)
 
 
